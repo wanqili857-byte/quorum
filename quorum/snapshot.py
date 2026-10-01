@@ -72,6 +72,13 @@ def _excluded(rel: str, patterns: List[str]) -> bool:
 
     旧版对目录用 `rel_dir.startswith(x)`，而当 `rel_dir == "."`（根那一层）时永远匹配不上，
     于是 `snapshot_exclude` 在根目录这一级静默失效。
+
+    同一个洞的**第二处**（canonbench 第二轮踩到）：非 glob 模式只按**仓库根前缀**匹配，
+    于是 `__pycache__` 这种「到处都有」的名字只能命中根目录那一个，嵌套的
+    `bench/universe/__pycache__` 全部漏网——实测 19 个 `.pyc` 被算进材料指纹，
+    于是同一天两次快照给出不同 digest，quorum 自己报出「材料快照不一致」的**假警报**
+    （而真警报和假警报长得一模一样，只能靠人肉查）。现在非 glob 模式按**路径段**匹配：
+    相等、前缀、后缀、或出现在路径中间都算。
     """
     import fnmatch
     rel = os.path.normpath(rel)
@@ -82,7 +89,9 @@ def _excluded(rel: str, patterns: List[str]) -> bool:
             if fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(os.path.basename(rel), p):
                 return True
             continue
-        if rel == p or rel.startswith(p + os.sep):
+        if rel == p or rel.startswith(p + os.sep) or rel.endswith(os.sep + p):
+            return True
+        if (os.sep + p + os.sep) in rel:
             return True
     return False
 
