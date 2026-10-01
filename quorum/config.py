@@ -71,6 +71,12 @@ class Channel:
     env: Dict[str, str] = field(default_factory=dict)
     # 形如 ANTHROPIC_AUTH_TOKEN_FILE 的键表示「值要从这个文件读」，密钥内容永不进配置
     argv: List[str] = field(default_factory=list)
+    # 内置起法（claude-cli / codex-cli）的**额外命令行标志**。
+    # 为什么需要：这类需求（放行只读命令的权限白名单、sandbox 标志、--max-turns）
+    # 此前只能绕到 exec 通道，而 exec 要求手写完整 argv 与 harness 名——使用者
+    # 很容易忘了写 harness，把两个不同的 CLI 记成同一个（plate 的独立性注记就废了）。
+    # exec 通道请把标志写进 argv，不要用这个字段（配了会直接报错，见 channels.py）。
+    args: List[str] = field(default_factory=list)
 
     @property
     def harness_name(self) -> str:
@@ -175,6 +181,7 @@ def load(path: str) -> Config:
             harness=spec.get("harness", ""),
             env={str(k): str(v) for k, v in (spec.get("env") or {}).items()},
             argv=list(spec.get("argv") or []),
+            args=[str(a) for a in (spec.get("args") or [])],
         )
 
     reviewers = []

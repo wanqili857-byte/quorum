@@ -499,3 +499,85 @@ def test_e2e_material_change_is_flagged(demo, tmp_path, monkeypatch):
 
 def test_cli_check_leaks_on_own_repo():
     assert main(["check-leaks", ROOT]) == 0, "公开仓必须通过自己的泄漏门禁"
+
+
+def test_channel_args_reach_builtin_kinds(tmp_path):
+    """内置起法也要能传标志（`args`）——否则「给审核员放行只读命令」只能绕 exec，
+    而 exec 要求手写 argv 与 harness 名，容易把两个 CLI 记成同一个 harness。
+
+    真实事故：三家审核员里两家被权限白名单挡住跑不了代码，最强的可执行验证全没拿到。
+    """
+    from quorum import channels
+    from quorum.config import Channel, Config, Reviewer
+    cfg = Config(project="p", brief="b", out_dir="o", repo="/tmp/repo",
+                 reviewers=[], channels={}, gates=None)
+    extra = ["--allowedTools", "Bash(python3:*),Read"]
+
+    cl = Channel("c", "claude-cli", model="m1", args=extra)
+    argv, _, writes = channels.build(cl, Reviewer("r", "c"), cfg, "PROMPT")
+    assert argv[:3] == ["claude", "-p", "PROMPT"]
+    assert "--model" in argv and argv[argv.index("--model") + 1] == "m1"
+    assert argv[-2:] == extra, "claude-cli：额外标志拼在末尾"
+    assert writes is False
+
+    cx = Channel("c", "codex-cli", args=extra)
+    argv2, _, writes2 = channels.build(cx, Reviewer("r", "c"), cfg, "PROMPT")
+    assert argv2[-2:] == ["-o", "__OUT__"] or "__OUT__" in argv2
+    # codex 的 prompt 是**位置参数**：标志必须插在它之前，否则会被当成 prompt 内容
+    assert argv2.index(extra[0]) < len(argv2) - 1
+    assert argv2[-1] == "PROMPT"
+    assert writes2 is True
+
+
+def test_exec_channel_rejects_args(tmp_path):
+    """exec 已经把 argv 完全交给你了——再配 args 只会让人猜哪一处生效，直接报错。"""
+    from quorum import channels
+    from quorum.config import Channel, Config, Reviewer
+    cfg = Config(project="p", brief="b", out_dir="o", repo="/tmp/repo",
+                 reviewers=[], channels={}, gates=None)
+    ch = Channel("c", "exec", argv=["x", "{prompt}"], args=["--flag"])
+    with pytest.raises(channels.ChannelError):
+        channels.build(ch, Reviewer("r", "c"), cfg, "PROMPT")
+
+
+def test_channel_args_loaded_from_config(tmp_path):
+    p = tmp_path / "r.yaml"
+    p.write_text(
+        "project: p\nrepo: .\nbrief: b.md\nout_dir: out\n"
+        "channels:\n"
+        "  c1: {kind: claude-cli, model: m, args: ['--allowedTools', 'Read']}\n"
+        "reviewers: [{name: a, channel: c1, vendor: va}]\n", encoding="utf-8")
+    ch = load(str(p)).channels["c1"]
+    assert ch.args == ["--allowedTools", "Read"]
+
+
+def test_gate_hint_explains_zero_findings():
+    """0 条发现必须说清**是哪一种 0**。
+
+    真实事故：审核员交了 21KB 有内容的结论，全写成标题式（`### F1 …`），
+    门禁按列名解析 → 0 条 → 整轮白跑；而当时的诊断只有「发现 0 条（标记 0）」，
+    使用者不知道该改什么。
+    """
+    from quorum.config import Config, Gates
+    cfg = Config(project="p", brief="b", out_dir="o", repo=".",
+                 reviewers=[], channels={},
+                 gates=Gates(min_bytes=10, min_findings=1,
+                             require_sections=["最脆弱"]))
+    heading_style = ("# 结论\n\n## 1. 严重度表\n\n### F1 · 某处不对\n"
+                     "问题描述足够长足够长。\n\n## 最脆弱\n状态轴没有正例。\n")
+    g = gates.evaluate(cfg, heading_style, rc=0, seconds=10)
+    assert g.findings == 0
+    assert "严重度" in g.hint and "表格" in g.hint      # 说清是「不是表格」
+    assert "严重度" in g.summary()
+
+    # 另一种 0：表在，但每行问题列是空话
+    thin = ("| 严重度 | 位置 | 问题 | 证据 |\n|---|---|---|---|\n| 🔴 | a.py | 不行 | x |\n"
+            "\n## 最脆弱\n无。\n")
+    g2 = gates.evaluate(cfg, thin, rc=0, seconds=10)
+    assert g2.findings == 0 and "不足 8 字" in g2.hint
+
+
+def test_prompt_states_output_contract():
+    """工单提示里必须写明输出契约——让格式要求**难以违反**，而不是事后判它违规。"""
+    from quorum.channels import DEFAULT_PROMPT
+    assert "严重度" in DEFAULT_PROMPT and "表格" in DEFAULT_PROMPT

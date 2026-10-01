@@ -32,6 +32,8 @@ DEFAULT_PROMPT = """你是独立外部审计员，与本项目无关。工作目
 要点：
 - 只读：不改任何现有文件、不新建文件、不重跑训练、不调用任何 LLM API（纯本地脚本可以跑）
 - 工单里给出的输出格式**直接作为你的回复正文**
+- **发现必须是一张 Markdown 表格，且表头含「严重度」列**——门禁按列名解析；
+  写成标题式（`### F1 …`）会被判「0 条发现」，整轮白跑
 - 引用的每个数字必须**自己从数据文件重算**，不从任何文档抄
 - 你的回复会被原样存档为审核结论，请直接输出结论文本，不要写任何文件。
 
@@ -79,6 +81,7 @@ def build(channel: Channel, reviewer: Reviewer, cfg: Config, prompt: str) -> Tup
         argv = ["claude", "-p", prompt]
         if channel.model:
             argv += ["--model", channel.model]
+        argv += list(channel.args)                 # 额外标志（权限白名单/sandbox/…）
         return argv, env, False
 
     if kind == "codex-cli":
@@ -86,6 +89,9 @@ def build(channel: Channel, reviewer: Reviewer, cfg: Config, prompt: str) -> Tup
                 "--skip-git-repo-check"]
         if channel.model:
             argv += ["--model", channel.model]
+        # 额外标志必须插在**位置参数 prompt 之前**：codex 的 prompt 是位置参数，
+        # 写在它后面的标志会被当成 prompt 的一部分
+        argv += list(channel.args)
         argv += ["-o", "__OUT__", prompt]          # __OUT__ 由 runner 替换成临时文件
         return argv, env, True
 
@@ -97,6 +103,10 @@ def build(channel: Channel, reviewer: Reviewer, cfg: Config, prompt: str) -> Tup
         # 必须改本文件的源码。那样「harness 可自定义」就是一句空话。
         if not channel.argv:
             raise ChannelError("exec 通道需要 argv（占位符：{prompt} / {repo} / {out}）")
+        if channel.args:
+            raise ChannelError(
+                "exec 通道请把标志直接写进 argv，不要用 args: %r\n"
+                "（两处都能加标志只会让人猜哪一处生效）" % (channel.args,))
         writes_to_file = any("{out}" in a for a in channel.argv)
         argv = [a.replace("{repo}", cfg.repo).replace("{prompt}", prompt)
                 for a in channel.argv]

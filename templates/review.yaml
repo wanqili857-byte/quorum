@@ -28,6 +28,11 @@ channels:
   endpoint:
     kind: claude-cli
     model: <该端点支持的模型名>
+    # args: 额外命令行标志。**审核员跑不了代码 = 最强的一类发现拿不到**
+    # （真实事故：三家审核员里两家被权限白名单挡住，可执行验证全没拿到）。
+    # 放行本地只读命令（白名单之外的工具在 -p 模式下直接拒绝，不是弹窗询问）：
+    # args: ["--allowedTools", "Bash(python3:*),Bash(git log:*),Bash(git show:*),"
+    #                          "Bash(grep:*),Bash(ls:*),Bash(wc:*),Read,Grep,Glob"]
     env:
       ANTHROPIC_BASE_URL: https://<你的端点>
       ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/<你的密钥文件>   # 只给路径，内容不进配置/命令行

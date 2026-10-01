@@ -26,6 +26,22 @@ channels:
 以 `_FILE` 结尾的 env 键，其值按文件路径处理——密钥不进配置文件，也不进命令行参数
 （命令行会进 `ps` 和 shell 历史）。
 
+**额外标志用 `args`**：内置起法（`claude-cli` / `codex-cli`）要传命令行标志时写 `args`，
+不要为此绕到 `exec`。`exec` 要求手写完整 argv **和 harness 名**——忘了写 harness 会把
+两个不同的 CLI 记成同一个，`plate` 的独立性注记随之失效。
+
+```yaml
+channels:
+  ark:
+    kind: claude-cli
+    model: kimi-k2.7-code
+    args: ["--allowedTools", "Bash(python3:*),Read,Grep"]   # 放行本地只读命令
+    env:
+      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/ark_key
+```
+
+`args` 只对内置起法生效；`exec` 配了它**直接报错**（两处都能加标志只会让人猜哪一处生效）。
+
 ### 两条来源轴（新增，别把它们混成一个）
 
 交叉审计的价值来自**失效模式独立**。独立有两种，是**两件事**：

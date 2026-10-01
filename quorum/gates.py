@@ -41,14 +41,16 @@ class GateResult:
     seconds: int
     findings: int = 0
     blocked: bool = False
+    hint: str = ""          # 未过门禁时的可操作诊断（「为什么是 0 条」）
 
     def summary(self) -> str:
         if self.blocked:
             return ("%dB · 审核员疑似**卡住**（未产出发现，输出里有环境/权限类措辞）· rc=%d · %ds"
                     % (self.size, self.rc, self.seconds))
-        return ("%dB · 发现 %d 条（标记 %d）· 缺章节 %s · rc=%d · %ds"
+        base = ("%dB · 发现 %d 条（标记 %d）· 缺章节 %s · rc=%d · %ds"
                 % (self.size, self.findings, self.marks,
                    self.missing_sections or "无", self.rc, self.seconds))
+        return base + ("　→ " + self.hint if self.hint else "")
 
 
 def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
@@ -58,10 +60,10 @@ def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
     「概述表里的 30 个 🔴 + 一句『最脆弱』+ 一堆句号」能凑出一份『合规』的空产出。
     标记数只作为附注保留在结果里。
     """
-    rows = split_table_rows(text)
+    rows_all = split_table_rows(text)
     # 只数**有实质内容**的发现：problem 列至少 8 个字符。
     # 旧版只堵死了 emoji 刷屏，没堵死「表里塞 30 行空话」——那同样是空产出。
-    rows = [r for r in rows if len(r[2].strip()) >= 8]
+    rows = [r for r in rows_all if len(r[2].strip()) >= 8]
     marks = len(SEVERITY_RE.findall(text))
     missing = [s for s in cfg.gates.require_sections if s not in text]
     passed = (len(text.encode()) >= cfg.gates.min_bytes
@@ -69,8 +71,24 @@ def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
               and not missing)
     low = text.lower()
     blocked = (not passed) and len(rows) == 0 and any(m.lower() in low for m in BLOCKED_MARKERS)
+    # 0 条发现时，说清是**哪一种 0**——否则使用者只看到「发现 0 条」，
+    # 不知道该怎么改（真实事故：审核员交了 21KB 有内容的结论，全是标题式，
+    # 被解析成 0 条，整轮白跑）。
+    hint = ""
+    if not passed and not rows and not blocked:
+        if rows_all:
+            hint = "有严重度表，但每行「问题」列不足 8 字，按空话处理"
+        elif "|" in text and "严重度" in text:
+            hint = ("看着像严重度表却没解析出任何行——检查表头是否含「严重度」列、"
+                    "以及是不是 Markdown 表格（分隔行要写 |---|）")
+        elif "严重度" in text:
+            # 真实事故：21KB 有内容的结论全写成 `### F1 · …`，被判 0 条整轮白跑
+            hint = ("「严重度」出现在正文里但**不是表格**——门禁按列名解析 Markdown 表格，"
+                    "标题式结论（`### F1 …`）会被判 0 条。工单的输出契约已写明要表格")
+        else:
+            hint = "未解析到任何发现行"
     return GateResult(passed, len(text.encode()), marks, missing, rc, seconds,
-                      findings=len(rows), blocked=blocked)
+                      findings=len(rows), blocked=blocked, hint=hint)
 
 
 def run_with_timeout(argv: List[str], env: Dict[str, str], timeout_s: int,
