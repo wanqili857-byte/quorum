@@ -51,27 +51,34 @@ class Verdict:
 
 
 def parse(path: str) -> List[Entry]:
+    r"""解析台账表。
+
+    **不重写切分逻辑**：与发现表共用 `gates._split_row`（转义 `\|`、反引号内竖线都不分隔）。
+    这里曾经是裸 `split("|")` —— 同一份输出契约的两处解析各写一套，是下一类静默错位。
+    """
     if not os.path.exists(path):
         return []
+    from .gates import _split_row          # 单一实现
     entries: List[Entry] = []
     header: List[str] = []
     for line in open(path, encoding="utf-8"):
-        s = line.strip()
-        if not s.startswith("|"):
+        if not line.strip().startswith("|"):
+            header = []                     # 表格结束 → 表头作废
             continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
-        if any(c in ("check", "check 命令", "断言") for c in cells):
-            header = [c.lower() for c in cells]
+        cells = _split_row(line)
+        if any(c.strip("*` ").lower() in ("check", "check 命令", "断言") for c in cells):
+            header = [c.strip("*` ").lower() for c in cells]
             continue
         if not header or set("".join(cells)) <= set("-: "):
+            continue
+        # 说明性表格（没有 status/状态 列）不该被当成台账行——台账的列是有契约的
+        if not any(c in header for c in ("status", "状态")):
             continue
         if len(cells) < len(header):
             cells += [""] * (len(header) - len(cells))
         row = dict(zip(header, cells))
-        check = row.get("check") or row.get("check 命令") or row.get("断言") or ""
-        check = check.strip()
-        if check.startswith("`") and check.endswith("`"):
-            check = check[1:-1]
+        raw_check = (row.get("check") or row.get("check 命令") or row.get("断言") or "").strip()
+        check = raw_check[1:-1] if raw_check.startswith("`") and raw_check.endswith("`") else raw_check
         entries.append(Entry(
             index=row.get(" #") or row.get("#") or str(len(entries) + 1),
             status=row.get("status") or row.get("状态") or "",
@@ -115,6 +122,9 @@ def render(verdicts: List[Verdict]) -> str:
                  sum(1 for v in verdicts if v.verdict == "ok"))]
     if n_nocheck:
         lines.append("（无断言的行不算修好——它们只是「作者说修好了」）")
+    if n_nocheck == len(verdicts) and verdicts:
+        lines.append("⚠️ **这份台账一条断言都没有**：`verify` 在这种情况下的绿灯**什么都不证明**。"
+                     "跑 `verify --strict` 会把它判失败。")
     return "\n".join(lines)
 
 

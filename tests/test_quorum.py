@@ -95,13 +95,21 @@ def test_config_allows_cross_role_in_same_family(tmp_path):
 
 
 def test_env_file_indirection_keeps_secret_out_of_config(tmp_path):
-    """`X_FILE` 指向的密钥文件内容进环境变量，配置里只有路径。"""
+    """`X_FILE` 指向的密钥文件内容进环境变量；**配置文件里只有路径**。
+
+    旧版最后一行断言的是 `str(sec.parent / "review.yaml")` —— 那个文件根本不存在，
+    字符串里当然不含密钥，于是这条断言**永远为真**。改成真的写一份配置并检查它。
+    """
     from quorum.channels import _resolve_env
     sec = tmp_path / "key"
     sec.write_text("SECRET-VALUE\n")
     got = _resolve_env({"ANTHROPIC_AUTH_TOKEN_FILE": str(sec)})
     assert got == {"ANTHROPIC_AUTH_TOKEN": "SECRET-VALUE"}
-    assert "SECRET-VALUE" not in str(sec.parent / "review.yaml")
+
+    cfg_p = tmp_path / "review.yaml"
+    cfg_p.write_text("channels:\n  c:\n    kind: claude-cli\n"
+                     "    env: {ANTHROPIC_AUTH_TOKEN_FILE: %s}\n" % sec, encoding="utf-8")
+    assert "SECRET-VALUE" not in cfg_p.read_text(encoding="utf-8")   # 真的读了配置
 
 
 # ------------------------------------------------------------------ 门禁
@@ -123,7 +131,7 @@ def test_gate_content_wins_over_exit_code():
                  reviewers=[Reviewer("r", "c")], channels={"c": Channel("c", "fake")},
                  gates=Gates(min_bytes=10, min_findings=1, require_sections=["最脆弱"]))
     text = ("| 严重度 | 位置 | 问题 | 证据 |\n|---|---|---|---|\n"
-            "| 🔴 | a.py | 真问题 | 我跑了 X |\n## 最脆弱的一环\n")
+            "| 🔴 | a.py | 这是一个有实质内容的问题描述 | 我跑了 X |\n## 最脆弱的一环\n")
     assert gates.evaluate(cfg, text, rc=143, seconds=1).passed
 
 
@@ -314,12 +322,29 @@ def test_e2e_rerun_protects_previous_findings(demo):
     assert baks, "第二次运行应把上一份结论留档，而不是覆盖"
 
 
-def test_e2e_material_change_is_flagged(demo, capsys):
-    """审核期间材料变了 → 结论头部必须写明（真实吃过：审核员看到的是中途状态）。"""
+def test_e2e_material_change_is_flagged(demo, tmp_path, monkeypatch):
+    """审核期间材料变了 → 结论头部必须写明。
+
+    旧版只断言 `"材料快照" in 结论` —— 而 runner **总是**写那一行，所以它永远为真。
+    这里让「期间材料被改」真的发生：把桩通道换成「先改一个被 sources 覆盖的文件再输出结论」。
+    """
     cfg = os.path.join(demo, "review.yaml")
+    from quorum import snapshot as snap_mod
+    touch = os.path.join(demo, "project", "report.md")
+    real_take = snap_mod.take
+    calls = {"n": 0}
+
+    def fake_take(c):
+        calls["n"] += 1
+        if calls["n"] == 2:                       # 审核结束后那一次：材料已变
+            with open(touch, "a", encoding="utf-8") as f:
+                f.write("\n<!-- 审核期间被改动 -->\n")
+        return real_take(c)
+
+    monkeypatch.setattr("quorum.cli.snapshot.take", fake_take)
     main(["run", "--config", cfg, "--reviewer", "alpha"])
-    p = os.path.join(demo, "out", "demo-findings-alpha.md")
-    assert "材料快照" in open(p, encoding="utf-8").read()
+    text = open(os.path.join(demo, "out", "demo-findings-alpha.md"), encoding="utf-8").read()
+    assert "材料在审核期间发生变化" in text
 
 
 def test_cli_check_leaks_on_own_repo():

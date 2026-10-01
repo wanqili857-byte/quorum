@@ -49,6 +49,9 @@ def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
     标记数只作为附注保留在结果里。
     """
     rows = split_table_rows(text)
+    # 只数**有实质内容**的发现：problem 列至少 8 个字符。
+    # 旧版只堵死了 emoji 刷屏，没堵死「表里塞 30 行空话」——那同样是空产出。
+    rows = [r for r in rows if len(r[2].strip()) >= 8]
     marks = len(SEVERITY_RE.findall(text))
     missing = [s for s in cfg.gates.require_sections if s not in text]
     passed = (len(text.encode()) >= cfg.gates.min_bytes

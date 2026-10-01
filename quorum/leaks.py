@@ -85,12 +85,16 @@ FIXTURE_FILE = os.path.abspath(__file__)
 def tracked_files(root: str) -> List[str]:
     """git 仓库 → 返回**被跟踪**的文件；否则返回 []（调用方回落到 os.walk）。
 
-    为什么只扫被跟踪的：这个门禁的职责是「**会被发布出去的东西**里有没有泄漏」。
-    结论目录、构建产物、虚拟环境都是 gitignore 的，扫描它们只会制造假警报，
-    而假警报会让真警报被忽略——那比不扫更糟。
+    扫描范围 = **被跟踪的 + 未跟踪但没被忽略的**（`git ls-files --cached --others --exclude-standard`）。
+    这个门禁的职责是「**会被发布出去的东西**里有没有泄漏」：构建产物、虚拟环境、结论目录
+    都是 gitignore 的，扫它们只会制造假警报（假警报会让真警报被忽略）。
+    但**未跟踪且未被忽略**的文件即将被提交，必须扫——新加的 `.env` 正落在这一类。
     """
     try:
-        out = subprocess.run(["git", "-C", root, "ls-files"],
+        # --others --exclude-standard 把「未跟踪但不被 .gitignore 忽略」的文件也算进来：
+        # 新加的 .env / *.pem / 无扩展名密钥正处于这一类，而它们**即将被提交**。
+        out = subprocess.run(["git", "-C", root, "ls-files",
+                              "--cached", "--others", "--exclude-standard"],
                              capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return []

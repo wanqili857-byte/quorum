@@ -66,7 +66,8 @@ def cmd_run(a) -> int:
 
         argv, env, writes_file = channels.build(cfg.channels[r.channel], r, cfg,
                                                 channels.build_prompt(cfg, r))
-        tmp_out = tempfile.mktemp(prefix="quorum-%s-" % n, suffix=".md")
+        fd, tmp_out = tempfile.mkstemp(prefix="quorum-%s-" % n, suffix=".md")
+        os.close(fd)
         if writes_file:
             argv = [tmp_out if x == "__OUT__" else x for x in argv]
             stdout_path = tmp_out + ".stream"
@@ -101,14 +102,19 @@ def cmd_run(a) -> int:
             gates.atomic_write(out, body)
             print("  %s 通过（%s）→ %s" % (OK, result.summary(), os.path.relpath(out, cfg.repo)))
         else:
-            fail_path = "%s.FAILED-%s.md" % (out[:-3], datetime.now().strftime("%H%M"))
+            fail_path = "%s.FAILED-%s.md" % (out[:-3], datetime.now().strftime("%H%M%S"))
+            # 同一分钟内同一个审核员第二次失败会覆盖掉第一份失败产出——失败也要留档（唯一记账入口）
+            gates.protect_existing(fail_path)
             gates.atomic_write(fail_path, text or "（空产出）")
             print("  %s 未过门禁（%s）→ %s" % (FAIL, result.summary(), os.path.relpath(fail_path, cfg.repo)))
             rc_all = 3
         gates.log(cfg, n, result, a.label)
         for f in (tmp_out, tmp_out + ".stream"):
-            if os.path.exists(f):
-                os.unlink(f)
+            try:
+                if os.path.exists(f):
+                    os.unlink(f)
+            except OSError:
+                pass
     return rc_all
 
 

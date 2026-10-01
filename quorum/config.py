@@ -164,10 +164,14 @@ def load(path: str) -> Config:
                 "审核员 %s 没有声明 family。family 是 COI 规则的**唯一依据**，"
                 "缺省值会让「同族不得有两个 primary」这条硬约束形同虚设"
                 "（三条 primary 全不写 family 就能全部通过）。" % spec["name"])
+        role = spec.get("role", "primary")
+        if role not in ("primary", "cross"):
+            raise ConfigError("审核员 %s 的 role=%r 非法（只能是 primary 或 cross）——"
+                              "写错大小写会让它静默生效为 cross 或 primary" % (spec["name"], role))
         reviewers.append(Reviewer(
             name=spec["name"], channel=ch,
             family=spec["family"],
-            role=spec.get("role", "primary"),
+            role=role,
             label=spec.get("label", ""),
             timeout_s=int(spec.get("timeout_s", 2700)),
             extra_env={str(k): str(v) for k, v in (spec.get("env") or {}).items()},

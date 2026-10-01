@@ -201,7 +201,7 @@ def cluster(rows: List[Row], thr_same_file: float = 0.07, thr_text: float = 0.10
         if best is not None:
             best.members.append(idx)
             best.rows.append(row)
-            best.why = "同文件 + 相似度 %.2f" % best_score if best_score > thr_text else "相似度 %.2f" % best_score
+            best.why = ("同文件 + 相似度 %.2f" % best_score) if same_file else ("相似度 %.2f" % best_score)
         else:
             c = Cluster([row])
             c.members = [idx]
@@ -266,6 +266,8 @@ def to_json(clusters: List[Cluster], snaps: Dict[str, str]) -> str:
             "reviewers": c.reviewers,
             "families": c.families,
             "match_reason": c.why,
+            "disagreement": c.disagreement,
+            "primary_families": c.primary_families,
             "sources": [{"reviewer": r.reviewer, "evidence": r.evidence} for r in c.rows],
         } for i, c in enumerate(clusters, 1)],
     }, ensure_ascii=False, indent=2)

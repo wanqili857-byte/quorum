@@ -63,6 +63,36 @@ def take(cfg: Config) -> Snapshot:
     return Snapshot("git", "git:%s" % h, detail, tree.files)
 
 
+def _excluded(rel: str, patterns: List[str]) -> bool:
+    """统一的排除判定：**规范化路径段**后比较，不靠裸 startswith。
+
+    旧版对目录用 `rel_dir.startswith(x)`，而当 `rel_dir == "."`（根那一层）时永远匹配不上，
+    于是 `snapshot_exclude` 在根目录这一级静默失效。
+    """
+    rel = os.path.normpath(rel)
+    for p in patterns:
+        p = os.path.normpath(p.rstrip("/"))
+        if rel == p or rel.startswith(p + os.sep):
+            return True
+    return False
+
+
+def _sample_hash(p: str, size: int) -> str:
+    """大文件的**取样哈希**：首尾各 64KB。
+
+    旧版对大文件只记 (大小, mtime) —— 于是「保持字节长度、mtime 秒相同的替换」
+    （`cp -p`、`tar -x`、按秒级时间戳覆盖）在指纹上**完全隐形**。取样不能证明内容相同，
+    但能让这类替换现形；代价写进 detail。
+    """
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        h.update(f.read(65536))
+        if size > 65536:
+            f.seek(max(0, size - 65536))
+            h.update(f.read(65536))
+    return h.hexdigest()
+
+
 def _tree(cfg: Config) -> Snapshot:
     paths: List[str] = []
     roots = cfg.sources or ["."]
@@ -76,15 +106,15 @@ def _tree(cfg: Config) -> Snapshot:
             for dirpath, dirnames, filenames in os.walk(full):
                 rel_dir = os.path.relpath(dirpath, cfg.repo)
                 dirnames[:] = [d for d in dirnames
-                               if not any(rel_dir.startswith(x.rstrip("/")) for x in cfg.snapshot_exclude)]
+                               if not _excluded(os.path.join(rel_dir, d), cfg.snapshot_exclude)]
                 paths += [os.path.join(dirpath, f) for f in filenames]
 
     h = hashlib.sha256()
     n = 0
-    skipped = 0
+    sampled = 0
     for p in sorted(set(paths)):
         rel = os.path.relpath(p, cfg.repo)
-        if any(rel.startswith(x.rstrip("/")) for x in cfg.snapshot_exclude):
+        if _excluded(rel, cfg.snapshot_exclude):
             continue
         try:
             st = os.stat(p)
@@ -98,10 +128,14 @@ def _tree(cfg: Config) -> Snapshot:
             except OSError:
                 pass
         else:
-            h.update(str(int(st.st_mtime)).encode())
-            skipped += 1
+            try:
+                h.update(_sample_hash(p, st.st_size).encode())
+            except OSError:
+                pass
+            sampled += 1
         n += 1
     detail = "非 git，文件树指纹（%d 个文件）" % n
-    if skipped:
-        detail += "；其中 %d 个 >%dMB 仅按 (大小, mtime) 计入" % (skipped, MAX_HASH_BYTES // (1024 * 1024))
+    if sampled:
+        detail += "；其中 %d 个 >%dMB 按**首尾各 64KB 取样**哈希（不足以证明内容全同）" % (
+            sampled, MAX_HASH_BYTES // (1024 * 1024))
     return Snapshot("tree", "tree:%s" % h.hexdigest()[:12], detail, n)
