@@ -49,6 +49,11 @@ class Pattern:
     regex: str
     sample: str          # 自检用：这条规则**必须**能抓到自己种的样本
     why: str = ""
+    # fail = 判定失败（退出码非零）；warn = 只提示。
+    # 分档的理由：像「`~/<任意词>/`」这种启发式规则会把 `~/workspace/`、`~/Documents/`
+    # 这类**正当目录**也命中——它没有语法办法区分「人名」和「目录名」。
+    # 把启发式规则和确定性规则混在同一档，结果是假警报淹没真警报。
+    severity: str = "fail"
 
 
 def default_patterns(username: str = "") -> List[Pattern]:
@@ -58,8 +63,10 @@ def default_patterns(username: str = "") -> List[Pattern]:
                 "/Users/someone/notes.md", "macOS/Linux 家目录里的用户名"),
         # 排除 `~/.config/` 这类点开头的标准目录：用户名不可能以点开头，
         # 而 `~/.config/ark_key` 这种写法在配置示例里到处都是（曾经把它误报成泄漏）。
-        Pattern("波浪线家目录", r"~/(?!\.|proj/|tmp/)[A-Za-z0-9_\-]+/",
-                "~/realname/work/x.md", "`~/<用户名>/` 形态——脱敏最常漏的一类"),
+        Pattern("波浪线家目录（启发式）", r"~/(?!\.|proj/|tmp/)[A-Za-z0-9_\-]+/",
+                "~/realname/work/x.md",
+                "`~/<某个词>/`。**启发式**：分不清人名与目录名（`~/workspace/` 这类正当占位符也会中）",
+                severity="warn"),
         # 必须**锚在路径里**：`[/~]name/`。
         # 旧版是裸词匹配 `(?<![\w/])name(?![\w])` —— 于是 CI 上（用户名恰好是 `runner`）
         # 它把英文单词 "runner" 全报成泄漏。**门禁的结果取决于跑它的机器**，这是比误报更糟的事。
@@ -149,6 +156,13 @@ def scan(root: str, patterns: List[Pattern], max_hits: int = 5,
     return hits
 
 
+def failing(hits: Dict[str, List[Tuple[str, int, str]]], patterns: List[Pattern]) -> Dict[str, List]:
+    """只挑出 severity=fail 的命中（决定退出码的就是这些）。"""
+    warn_names = {p.name for p in (patterns or []) if p.severity == "warn"}
+    return {k: v for k, v in hits.items()
+            if k not in warn_names and k != "__skipped__" and v}
+
+
 def self_test(patterns: List[Pattern]) -> List[str]:
     """给每条规则种样本、断言能抓到。返回失败清单（空 = 通过）。
 
@@ -168,14 +182,17 @@ def self_test(patterns: List[Pattern]) -> List[str]:
 
 
 def render(hits: Dict[str, List[Tuple[str, int, str]]], root: str,
-           skipped: Optional[List[str]] = None) -> str:
+           skipped: Optional[List[str]] = None,
+           patterns: Optional[List[Pattern]] = None) -> str:
     real = {k: v for k, v in hits.items() if k != "__skipped__" and v}
     if not real:
         out = ["在 %s 下未发现任何命中。" % root]
     else:
-        out = ["在 %s 下发现：" % root, ""]
+        warn_names = {p.name for p in (patterns or []) if p.severity == "warn"}
+    out = ["在 %s 下发现：" % root, ""]
     for name, items in sorted(real.items()):
-        out.append("- **%s**：%d 处（最多显示 5）" % (name, len(items)))
+        tag = "（提示，不判定失败）" if name in warn_names else ""
+        out.append("- **%s**%s：%d 处（最多显示 5）" % (name, tag, len(items)))
         for rel, ln, frag in items:
             out.append("  - `%s:%d` → `%s`" % (rel, ln, frag))
     if skipped:

@@ -339,7 +339,10 @@ def test_leak_scan_finds_username_and_secrets(tmp_path):
     tok = "sk-" + "abcdefghijkl"
     (tmp_path / "notes.md").write_text("路径 %s\n token %s\n" % (home, tok), encoding="utf-8")
     hits = leaks.scan(str(tmp_path), leaks.default_patterns("realuser"))
-    assert "波浪线家目录" in hits and "凭证形态" in hits
+    assert "波浪线家目录（启发式）" in hits and "凭证形态" in hits
+    # 启发式档不算失败：`~/workspace/` 这类正当占位符也在它管辖内
+    assert "波浪线家目录（启发式）" not in leaks.failing(hits, leaks.default_patterns("realuser"))
+    assert "凭证形态" in leaks.failing(hits, leaks.default_patterns("realuser"))
 
 
 def test_leak_scan_clean_on_safe_text(tmp_path):

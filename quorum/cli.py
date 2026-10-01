@@ -201,8 +201,10 @@ def cmd_leaks(a) -> int:
         return 1
     hits = leaks.scan(a.dir, pats, skip_files=(leaks.FIXTURE_FILE,) + tuple(os.path.abspath(x) for x in a.ignore))
     skipped = hits.pop("__skipped__", [])
-    print(leaks.render(hits, a.dir, skipped))
-    return 1 if {k: v for k, v in hits.items() if v} else 0
+    print(leaks.render(hits, a.dir, skipped, pats))
+    # 退出码只看 fail 档：启发式规则的命中的是「看一眼」而不是「拦住提交」，
+    # 否则 `~/workspace/` 这类正当占位符会把真警报淹掉。
+    return 1 if leaks.failing(hits, pats) else 0
 
 
 # -------------------------------------------------------------------- main
