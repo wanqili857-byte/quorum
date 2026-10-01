@@ -1,0 +1,21 @@
+# demo 的配置：三个审核员全部走「桩通道」，**不需要任何 API key**。
+project: demo
+repo: .                       # 相对本文件所在目录解析
+brief: briefs/brief.md
+out_dir: out
+sources: ["project", "briefs", "canned"]
+ledger: out/demo-dispose.md
+
+channels:
+  fake:
+    kind: fake
+    argv: ["python3", "channels/fake_reviewer.py"]
+
+reviewers:
+  # family 是 COI 规则的基础：同一 family 不能有两个 primary
+  - {name: alpha, channel: fake, family: vendor-a, role: primary, env: {FAKE_PERSONA: alpha}}
+  - {name: beta,  channel: fake, family: vendor-b, role: primary, env: {FAKE_PERSONA: beta}}
+  - {name: gamma, channel: fake, family: vendor-c, role: cross,   env: {FAKE_PERSONA: gamma}}
+
+# 门禁阈值调小，因为 canned 结论是缩微版；真实项目用默认值（2000B / 5 条标记）
+gates: {min_bytes: 300, min_severity_marks: 3, require_sections: ["最脆弱"]}

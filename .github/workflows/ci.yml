@@ -1,0 +1,19 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e '.[dev]'
+      # 全部测试走 fake 通道 —— 不需要任何 API key
+      - run: pytest -q
+      # 公开仓必须通过自己的泄漏门禁（否则 pre-commit 也白搭）
+      - run: quorum check-leaks .

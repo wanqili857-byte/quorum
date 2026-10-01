@@ -1,0 +1,19 @@
+# 接一个 Anthropic 兼容端点（示例：火山 Ark 的 coding 端点）。
+# 换厂商 = 改 env，不改代码。
+project: example
+repo: ..
+brief: reviews/brief.md
+out_dir: reviews/out
+
+channels:
+  ark:
+    kind: claude-cli
+    model: kimi-k2.7-code
+    env:
+      ANTHROPIC_BASE_URL: https://ark.cn-beijing.volces.com/api/coding
+      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/ark_key
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000"
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144"    # 显式声明，否则客户端按默认窗口处理
+
+reviewers:
+  - {name: kimi, channel: ark, family: moonshot, role: primary}

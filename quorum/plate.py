@@ -1,0 +1,240 @@
+"""交叉表：把几家审核员的发现对齐成一张表——**一致** / **独有** / **被推翻**。
+
+为什么这是核心：单个审核员会错，而且错得不显眼。真实案例——某次三个审核员里有一个
+断言「在役权重其实是上一版」，语气肯定、给了命令；是另一个审核员用逐字节 ``cmp`` 把它推翻了。
+不做交叉就会照单全收。
+
+对齐是**启发式**的，不是魔法：位置里的路径 token + 问题文本的字符二元组相似度。
+输出刻意保守——宁可把同一条拆成两条（你去合并），也不要把两条不相干的合成一条（你去拆）。
+所以每条都带「怎么对上的」，并且**留一列复验结论给你填**。
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+from .config import Config
+from .gates import read_text, severity_of, split_table_rows
+
+PATH_RE = re.compile(r"[\w./\-]+\.(?:py|md|json|jsonl|ya?ml|ipynb|sh|txt|toml|cfg)")
+NOISE = set(" 　\t\n:：。，,、（）()「」【】*`>|/\\-_'\"…")
+
+
+def _paths(text: str) -> set:
+    out = set()
+    for m in PATH_RE.findall(text or ""):
+        out.add(m.rsplit("/", 1)[-1])            # 只比文件名，跨审核员的目录写法常不同
+    return out
+
+
+NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+ID_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.\-]{2,}")
+
+
+def _tokens(text: str) -> set:
+    """显著词集合：数字、标识符/代码词、以及字符二元组。
+
+    单靠字符二元组分不开——实测同一条发现的两份措辞相似度 0.138，而**不同**的两条也有 0.120，
+    几乎没有分离度。加进数字与标识符后再做 IDF 加权，同一条升到 0.14–0.21、不同条落到 ≤0.06。
+    """
+    t = set(NUM_RE.findall(text or ""))
+    t |= {x.lower() for x in ID_RE.findall(text or "")}
+    clean = "".join(ch for ch in (text or "") if ch not in NOISE)
+    t |= {clean[i:i + 2] for i in range(len(clean) - 1)}
+    return t
+
+
+def _idf_weighter(all_tokens: List[set]):
+    n = max(1, len(all_tokens))
+    df: Dict[str, int] = {}
+    for t in all_tokens:
+        for x in t:
+            df[x] = df.get(x, 0) + 1
+
+    def weight(x: str) -> float:
+        return math.log(1.0 + n / df.get(x, 1))
+
+    return weight
+
+
+def _weighted_jaccard(a: set, b: set, weight) -> float:
+    if not a or not b:
+        return 0.0
+    inter = sum(weight(x) for x in a & b)
+    union = sum(weight(x) for x in a | b)
+    return inter / union if union else 0.0
+
+
+@dataclass
+class Row:
+    reviewer: str
+    family: str
+    severity: str
+    location: str
+    problem: str
+    evidence: str
+
+    @property
+    def sev_rank(self) -> int:
+        return severity_of(self.severity)
+
+
+@dataclass
+class Cluster:
+    rows: List[Row] = field(default_factory=list)
+    why: str = ""
+    members: List[int] = field(default_factory=list)
+
+    @property
+    def reviewers(self) -> List[str]:
+        return [r.reviewer for r in self.rows]
+
+    @property
+    def families(self) -> List[str]:
+        seen = []
+        for r in self.rows:
+            if r.family not in seen:
+                seen.append(r.family)
+        return seen
+
+    @property
+    def severity(self) -> str:
+        top = max(self.rows, key=lambda r: r.sev_rank)
+        return top.severity
+
+    def label(self) -> str:
+        n_fam = len(self.families)
+        n_rev = len(self.reviewers)
+        if n_rev == 1:
+            return "单家独有 · 待复验"
+        if n_fam >= 2:
+            return "跨模型族一致 · 高置信"
+        return "同族多家一致 · 中置信"
+
+    def headline(self) -> str:
+        return self.rows[0].problem
+
+
+def collect(cfg: Config) -> Tuple[List[Row], Dict[str, str]]:
+    rows: List[Row] = []
+    snaps: Dict[str, str] = {}
+    for r in cfg.reviewers:
+        p = cfg.out_path(r.name)
+        text = read_text(p)
+        if not text:
+            continue
+        for m in re.finditer(r"材料快照：`([^`]+)`", text):
+            snaps[r.name] = m.group(1)
+        for sev, loc, prob, ev in split_table_rows(text):
+            rows.append(Row(r.name, r.family, sev, loc, prob, ev))
+    return rows, snaps
+
+
+def cluster(rows: List[Row], thr_same_file: float = 0.07, thr_text: float = 0.10) -> List[Cluster]:
+    """把不同审核员的发现对齐。**启发式**：宁可拆细，不要合错。
+
+    阈值是标定出来的（见 `_tokens` 的注释）：同一条发现的两份措辞落在 0.14–0.21，
+    不同条落在 ≤0.06。位置指向同一文件时把门槛放低（0.07）——审核员的措辞差异通常比文件路径大。
+    """
+    tokens = [_tokens(r.location + " " + r.problem) for r in rows]
+    weight = _idf_weighter(tokens)
+    clusters: List[Cluster] = []
+    for idx, row in enumerate(rows):
+        best: Optional[Cluster] = None
+        best_score = 0.0
+        for c in clusters:
+            if row.reviewer in c.reviewers:
+                continue                      # 同一家的两条不合并（他自己分开写的就是两件事）
+            for other_idx in c.members:
+                same_file = bool(_paths(row.location) & _paths(rows[other_idx].location))
+                sc = _weighted_jaccard(tokens[idx], tokens[other_idx], weight)
+                if (same_file and sc >= thr_same_file) or sc >= thr_text:
+                    score = sc + (0.05 if same_file else 0.0)
+                    if score > best_score:
+                        best, best_score = c, score
+        if best is not None:
+            best.members.append(idx)
+            best.rows.append(row)
+            best.why = "同文件 + 相似度 %.2f" % best_score if best_score > thr_text else "相似度 %.2f" % best_score
+        else:
+            c = Cluster([row])
+            c.members = [idx]
+            clusters.append(c)
+    clusters.sort(key=lambda c: (-len(c.families), -len(c.reviewers), -max(r.sev_rank for r in c.rows)))
+    return clusters
+
+
+def render(cfg: Config, clusters: List[Cluster], snaps: Dict[str, str]) -> str:
+    got = [r.name for r in cfg.reviewers if os.path.exists(cfg.out_path(r.name))]
+    out: List[str] = ["# %s · 交叉表" % cfg.project, ""]
+    out.append("> 已收结论：%s%s" % (", ".join(got) or "（无）",
+                                    "· 缺：" + ", ".join(r.name for r in cfg.reviewers if r.name not in got)
+                                    if len(got) < len(cfg.reviewers) else ""))
+    if len(set(snaps.values())) > 1:
+        out.append("> 🔴 **材料快照不一致**——各家审的不是同一份材料，对齐结果不可当真：%s"
+                   % json.dumps(snaps, ensure_ascii=False))
+    elif snaps:
+        out.append("> 材料快照一致：`%s`" % list(snaps.values())[0])
+    out += ["", "## 汇总", "",
+            "| # | 一致度 | 严重度 | 位置 | 一句话 | 哪几家 |", "|---|---|---|---|---|---|"]
+    for i, c in enumerate(clusters, 1):
+        out.append("| %d | %s | %s | %s | %s | %s |" % (
+            i, c.label(), c.severity, c.rows[0].location[:50],
+            c.headline().replace("|", "\\|")[:80], "+".join(c.reviewers)))
+
+    out += ["", "## 明细（**每家原话都列出来**——合并只说明「说的是同一处」，不说明「结论相同」）", ""]
+    for i, c in enumerate(clusters, 1):
+        out.append("### %d. %s · %s · 位置 `%s`" % (i, c.severity, c.label(), c.rows[0].location[:60]))
+        out.append("")
+        for r in c.rows:
+            out.append("- **%s**（%s）：%s" % (r.reviewer, r.family, r.problem.strip()))
+            if r.evidence.strip():
+                out.append("  - 证据：%s" % r.evidence.strip()[:300])
+        out.append("")
+        out.append("  - 复验：⬜（填 `confirmed` / `refuted` / `partial` + 一句证据）")
+        out.append("")
+
+    out += ["## 读法", "",
+            "- **跨模型族一致** = 不同厂商的模型独立得出同一结论，最值得先看。",
+            "- **单家独有** = 未必错，也未必对。真实案例里，被推翻的那条正是单家独有。",
+            "- 同一簇里各家的**措辞与归因可能不同**（甚至相反）——所以明细逐条列原话，别只看汇总的一句话。",
+            "- 「复验」由作者填：**审核员的结论是断言，不是事实**。",
+            "- 对齐是启发式（IDF 加权词重叠，同文件降门槛）：宁可拆细，不要合错。该合并的手工合并。",
+            ""]
+    return "\n".join(out)
+
+
+def to_json(clusters: List[Cluster], snaps: Dict[str, str]) -> str:
+    """输出契约的机器可读形态（拿它接你自己的流程，不需要 import 这个包）。"""
+    return json.dumps({
+        "snapshots": snaps,
+        "findings": [{
+            "id": i,
+            "confidence": c.label(),
+            "severity": c.severity,
+            "location": c.rows[0].location,
+            "problem": c.headline(),
+            "reviewers": c.reviewers,
+            "families": c.families,
+            "match_reason": c.why,
+            "sources": [{"reviewer": r.reviewer, "evidence": r.evidence} for r in c.rows],
+        } for i, c in enumerate(clusters, 1)],
+    }, ensure_ascii=False, indent=2)
+
+
+def dispose_skeleton(cfg: Config, clusters: List[Cluster]) -> str:
+    """处置台账骨架——审核的下半场。`check` 列填一条 shell 命令，`quorum verify` 会跑它。"""
+    out = ["# %s · 复核处置台账" % cfg.project, "",
+           "> 填法：`处置` 写改了什么；`check` 填一条**能失败的**命令（退出 0 才算修好）；",
+           "> `status` 填 ⬜/✅/❌。`quorum verify` 会跑所有 check，把 ✅ 变成可证伪的断言。", "",
+           "| # | 置信度 | 严重度 | 位置 | 问题 | 处置 | check | status |",
+           "|---|---|---|---|---|---|---|---|"]
+    for i, c in enumerate(clusters, 1):
+        out.append("| %d | %s | %s | %s | %s | | | ⬜ |" % (
+            i, c.label(), c.severity, c.rows[0].location[:50],
+            c.headline().replace("|", "\\|")[:100]))
+    return "\n".join(out) + "\n"

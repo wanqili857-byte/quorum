@@ -1,0 +1,31 @@
+# quorum 配置骨架。路径语义：配置里声明的相对路径按**本文件所在目录**解析。
+project: my-project
+repo: .                       # 项目根（审核员的工作目录）
+brief: reviews/brief.md       # 工单：自包含，审核员没有前轮记忆
+out_dir: reviews/out
+ledger: reviews/dispose.md    # 处置台账（verify 读它）
+sources: ["src", "data", "reports"]   # 材料快照指纹覆盖这些路径
+snapshot_exclude: ["reviews/out", "node_modules", ".venv"]
+
+channels:
+  # 任何 Anthropic 兼容端点都能接：换厂商 = 改这里的 env，不动代码
+  ark:
+    kind: claude-cli
+    model: kimi-k2.7-code
+    env:
+      ANTHROPIC_BASE_URL: https://ark.cn-beijing.volces.com/api/coding
+      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/ark_key   # 只给路径，内容不进配置/命令行
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000"
+  codex:
+    kind: codex-cli
+
+reviewers:
+  # family 决定 COI：同一 family 不能有两个 primary（同源模型看不出同源盲区）
+  - {name: kimi,  channel: ark,   family: moonshot, role: primary}
+  - {name: qwen,  channel: ark,   family: qwen,     role: primary}
+  - {name: codex, channel: codex, family: deepseek, role: cross}
+
+gates:
+  min_bytes: 2000
+  min_severity_marks: 5
+  require_sections: ["最脆弱"]
