@@ -78,6 +78,17 @@ def test_env_file_indirection_keeps_secret_out_of_config(tmp_path):
 
 
 # ------------------------------------------------------------------ 门禁
+def test_env_var_reference(monkeypatch):
+    """`${VAR}` 从环境变量取值；未设置时报错，不静默传空串。"""
+    from quorum.channels import _resolve_env, ChannelError
+    monkeypatch.setenv("QUORUM_TEST_TOKEN", "tok-123")
+    assert _resolve_env({"ANTHROPIC_AUTH_TOKEN": "${QUORUM_TEST_TOKEN}"}) == {
+        "ANTHROPIC_AUTH_TOKEN": "tok-123"}
+    monkeypatch.delenv("QUORUM_TEST_TOKEN")
+    with pytest.raises(ChannelError):
+        _resolve_env({"ANTHROPIC_AUTH_TOKEN": "${QUORUM_TEST_TOKEN}"})
+
+
 def test_gate_content_wins_over_exit_code():
     """内容门全过即接受：rc=143（信号收尾）不该让一份完整结论作废。"""
     from quorum.config import Config, Gates, Reviewer, Channel

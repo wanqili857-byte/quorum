@@ -1,0 +1,34 @@
+# quorum 审自己 —— 第一次跑真通道。
+project: quorum
+repo: ..
+brief: brief.md
+out_dir: out
+sources: ["quorum", "tests", "demo", "docs", "templates", "CONTRACT.md", "README.md"]
+snapshot_exclude: ["reviews/out", ".venv", "__pycache__"]
+
+channels:
+  ark:                                  # 任何 Anthropic 兼容端点都能接
+    kind: claude-cli
+    model: kimi-k2.7-code
+    env:
+      ANTHROPIC_BASE_URL: https://ark.cn-beijing.volces.com/api/coding
+      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/ark_key
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000"
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144"
+  dashscope:
+    kind: claude-cli
+    model: qwen3.8-flash
+    env:
+      ANTHROPIC_BASE_URL: https://dashscope.aliyuncs.com/apps/anthropic
+      ANTHROPIC_AUTH_TOKEN: ${QWEN_API_KEY}
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144"
+  codex:
+    kind: codex-cli
+
+reviewers:
+  # family 决定 COI：同族不得有两个 primary
+  - {name: kimi,  channel: ark,       family: moonshot, role: primary, timeout_s: 2400}
+  - {name: qwen,  channel: dashscope, family: qwen,     role: primary, timeout_s: 2400, label: "第一轮就用过的审核员"}
+  - {name: codex, channel: codex,     family: deepseek, role: cross,   timeout_s: 2400}
+
+gates: {min_bytes: 2000, min_severity_marks: 5, require_sections: ["最脆弱"]}

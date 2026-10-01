@@ -4,8 +4,9 @@
 
 * ``claude-cli`` —— 任何 **Anthropic 兼容端点**（官方、各厂商的兼容网关）都能接。
   接一个新厂商 = 在 ``review.yaml`` 里加一段 env，**不动代码**。
-  约定：env 里以 ``_FILE`` 结尾的键，其值按「文件路径」处理，读出来赋给去掉 ``_FILE`` 的键
-  —— 这样密钥内容永远不进配置文件，也不进命令行参数（命令行会进 ps 与 shell 历史）。
+  约定（两种引用方式，密钥永远不进配置文件、也不进命令行参数——命令行会进 ps 与 shell 历史）：
+    * ``X_FILE: /path`` → 读文件内容填进 ``X``
+    * ``X: ${ENV_VAR}`` → 从环境变量取值；变量未设置时报错而不是静默传空串
 * ``codex-cli``  —— 本机 codex CLI，``exec -s read-only``，结论写文件。
 * ``fake``       —— 不调模型的桩，用于测试与 demo（公开仓必须能无密钥跑通全流程）。
 
@@ -52,7 +53,12 @@ def _resolve_env(env: Dict[str, str]) -> Dict[str, str]:
                 raise ChannelError("通道 env %s 指向的文件不存在：%s" % (k, p))
             out[k[:-5]] = open(p, encoding="utf-8").read().strip()
         else:
-            out[k] = os.path.expanduser(v)
+            # 支持 `${VAR}` 引用环境变量——很多厂商把 token 放在环境变量里而不是文件里。
+            v2 = os.path.expandvars(v)
+            if "$" in v2 and v2 == v and "${" in v:
+                raise ChannelError(
+                    "通道 env %s 引用的环境变量没有设置：%s" % (k, v))
+            out[k] = os.path.expanduser(v2)
     return out
 
 
