@@ -3,6 +3,7 @@ project: quorum
 repo: ..
 brief: brief.md
 out_dir: out
+ledger: dispose.md          # 相对本文件 → reviews/dispose.md
 sources: ["quorum", "tests", "demo", "docs", "templates", "CONTRACT.md", "README.md"]
 snapshot_exclude: ["reviews/out", ".venv", "__pycache__"]
 
