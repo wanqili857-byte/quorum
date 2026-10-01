@@ -111,7 +111,7 @@ quorum 被它自己审过三轮 —— 三个真通道（kimi / qwen / codex）�
 |---|---|
 | `reviews/brief.md` | 自审工单（按「声明」组织，不是按文件） |
 | `reviews/review.yaml` | 真通道配置（三个不同模型族） |
-| `reviews/out/round*/` | 三轮的原始结论 + 交叉表 |
+| `reviews/rounds/` | 三轮的原始结论 + 交叉表（含一件缺件的如实说明） |
 | `reviews/dispose.md` | 处置台账，**20 条带可执行断言** |
 
 跑一下：
