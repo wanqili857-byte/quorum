@@ -581,3 +581,28 @@ def test_prompt_states_output_contract():
     """工单提示里必须写明输出契约——让格式要求**难以违反**，而不是事后判它违规。"""
     from quorum.channels import DEFAULT_PROMPT
     assert "严重度" in DEFAULT_PROMPT and "表格" in DEFAULT_PROMPT
+
+
+def test_ledger_row_survives_unclosed_code_span():
+    """台账骨架生成的行，单元格数必须等于列数。
+
+    事故（2026-10-01 真实踩到）：headline 里一个**未闭合的反引号**跨过截断点
+    （``…，且 `--top`` 正好在第 100 个字符处被切），于是 `_split_row` 按 markdown 规则
+    把代码段内的 `|` 当成字面竖线，**8 列的行被切成 5 格**——`status` / `check`
+    落到别的格子里：那一行明明填了 ✅，`verify` 却报「无断言」。
+    看报告的人会以为是自己没填。
+
+    断言用**列数**，不用「某个字符串在不在」——后者被解释性注释满足过。
+    """
+    hl = ("注释 `top 13：12 个内容组件 + 教育背景` 与实际不符：实际入选 11"
+          "（project 5 + experience 3 + skill 2 + education 1），且 `--top 根本没生效")
+
+    class _C:
+        project = "t"
+    c = plate.Cluster(rows=[plate.Row("x", "v", "h", "🟢", "`build.sh:45`", hl, "")])
+    c.members = [0]
+
+    row = [l for l in plate.dispose_skeleton(_C(), [c]).split("\n") if l.startswith("| 1 |")][0]
+    header_cols = len(plate.dispose_skeleton(_C(), [c]).split("\n")[6].split("|")) - 2
+    assert len(gates._split_row(row)) == header_cols, \
+        "骨架行被切成 %d 格，应为 %d 格：%r" % (len(gates._split_row(row)), header_cols, row[-60:])

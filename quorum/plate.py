@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .config import Config
-from .gates import read_text, severity_of, split_table_rows
+from .gates import clip_cell, read_text, severity_of, split_table_rows
 
 PATH_RE = re.compile(r"[\w./\-]+\.(?:py|md|json|jsonl|ya?ml|ipynb|sh|txt|toml|cfg)")
 NOISE = set(" 　\t\n:：。，,、（）()「」【】*`>|/\\-_'\"…")
@@ -272,7 +272,7 @@ def render(cfg: Config, clusters: List[Cluster], snaps: Dict[str, str]) -> str:
     for i, c in enumerate(clusters, 1):
         out.append("| %d | %s | %s | %s | %s | %s |" % (
             i, c.label(), c.severity, c.rows[0].location[:50],
-            c.headline().replace("|", "\\|")[:80], "+".join(c.reviewers)))
+            clip_cell(c.headline(), 80), "+".join(c.reviewers)))
 
     out += ["", "## 明细（**每家原话都列出来**——合并只说明「说的是同一处」，不说明「结论相同」）", ""]
     for i, c in enumerate(clusters, 1):
@@ -335,5 +335,5 @@ def dispose_skeleton(cfg: Config, clusters: List[Cluster]) -> str:
     for i, c in enumerate(clusters, 1):
         out.append("| %d | %s | %s | %s | %s | | | ⬜ |" % (
             i, c.label(), c.severity, c.rows[0].location[:50],
-            c.headline().replace("|", "\\|")[:100]))
+            clip_cell(c.headline(), 100)))
     return "\n".join(out) + "\n"

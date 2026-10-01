@@ -14,6 +14,8 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional
 
+from .gates import clip_cell          # markdown 单元格裁剪（防未闭合代码段把行切错位）
+
 OK_MARKS = ("✅", "☑", "✔")
 TODO_MARKS = ("⬜", "❌", "🚧")
 
@@ -130,7 +132,7 @@ def render(verdicts: List[Verdict]) -> str:
     for v in verdicts:
         mark = {"LIE": "🔴 台账说谎", "stale": "🟡 台账未更新", "no-check": "⚪ 无断言",
                 "ok": "✅", "pending": "⬜ 未修", "error": "🔴 执行失败"}[v.verdict]
-        out = (v.output or "").replace("\n", " ").replace("|", "\\|")[:160]
+        out = clip_cell((v.output or "").replace("\n", " "), 160)
         lines.append("| %s | %s | `%s` | %s | %s |" % (
             v.entry.index, v.entry.status or "-", (v.entry.check or "-")[:70], mark, out))
     n_lie = sum(1 for v in verdicts if v.verdict == "LIE")
