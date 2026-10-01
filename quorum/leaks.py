@@ -16,7 +16,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # 不再用扩展名白名单：**漏掉的恰恰是最危险的**（`.env` / `.log` / `.pem` / 无扩展名）。
 # 改为「读得动就读」——按内容嗅探二进制，读不动就跳过。
@@ -110,7 +110,9 @@ def scan(root: str, patterns: List[Pattern], max_hits: int = 5,
     ``skip_files`` 存绝对路径。默认由 CLI 传入本模块自身（见 ``FIXTURE_FILE``）。
     """
     compiled = _compile(patterns)
+    skipped: List[str] = []
     hits: Dict[str, List[Tuple[str, int, str]]] = {}
+    hits["__skipped__"] = []
     files = tracked_files(root)
     if files:
         candidates = [(f, os.path.relpath(f, root)) for f in files]
@@ -122,10 +124,13 @@ def scan(root: str, patterns: List[Pattern], max_hits: int = 5,
                 p = os.path.join(dirpath, fn)
                 if _is_text(p):
                     candidates.append((p, os.path.relpath(p, root)))
+                else:
+                    skipped.append(os.path.relpath(p, root))
     for p, rel in candidates:
         if os.path.abspath(p) in skip_files or not os.path.exists(p):
             continue
         if not _is_text(p):
+            skipped.append(rel)          # 静默跳过 = 静默盲区：二进制/超大/非 UTF-8 的文件必须报出来
             continue
         try:
             for i, line in enumerate(open(p, encoding="utf-8", errors="ignore"), 1):
@@ -158,12 +163,21 @@ def self_test(patterns: List[Pattern]) -> List[str]:
     return failures
 
 
-def render(hits: Dict[str, List[Tuple[str, int, str]]], root: str) -> str:
-    if not hits:
-        return "在 %s 下未发现任何命中。" % root
-    out = ["在 %s 下发现：" % root, ""]
-    for name, items in sorted(hits.items()):
+def render(hits: Dict[str, List[Tuple[str, int, str]]], root: str,
+           skipped: Optional[List[str]] = None) -> str:
+    real = {k: v for k, v in hits.items() if k != "__skipped__" and v}
+    if not real:
+        out = ["在 %s 下未发现任何命中。" % root]
+    else:
+        out = ["在 %s 下发现：" % root, ""]
+    for name, items in sorted(real.items()):
         out.append("- **%s**：%d 处（最多显示 5）" % (name, len(items)))
         for rel, ln, frag in items:
             out.append("  - `%s:%d` → `%s`" % (rel, ln, frag))
+    if skipped:
+        out += ["", "⚠️ 有 %d 个文件**跳过未扫**（二进制 / >%dMB / 非 UTF-8）——跳过即盲区，不是「干净」："
+                % (len(skipped), MAX_FILE_BYTES // (1024 * 1024))]
+        out += ["  - `%s`" % s for s in skipped[:10]]
+        if len(skipped) > 10:
+            out.append("  - …其余 %d 个" % (len(skipped) - 10))
     return "\n".join(out)

@@ -60,6 +60,10 @@ def take(cfg: Config) -> Snapshot:
     h = hashlib.sha256(("%s\n%s\n%s" % (head, status, tree.digest)).encode()).hexdigest()[:12]
     detail = "git %s%s + 材料树 %s（%d 个文件）" % (
         head[:12], "，工作区有未提交改动" if status else "，工作区干净", tree.digest, tree.files)
+    # 取样免责声明必须跟着走：`_tree` 把它写在 tree.detail 里，而 git 模式另建 detail，
+    # 旧版因此把「大文件只是取样」这句话**在最常见的场景里丢掉了**。
+    if "取样" in tree.detail:
+        detail += "；" + tree.detail.split("；", 1)[1] if "；" in tree.detail else ""
     return Snapshot("git", "git:%s" % h, detail, tree.files)
 
 
@@ -69,9 +73,15 @@ def _excluded(rel: str, patterns: List[str]) -> bool:
     旧版对目录用 `rel_dir.startswith(x)`，而当 `rel_dir == "."`（根那一层）时永远匹配不上，
     于是 `snapshot_exclude` 在根目录这一级静默失效。
     """
+    import fnmatch
     rel = os.path.normpath(rel)
     for p in patterns:
         p = os.path.normpath(p.rstrip("/"))
+        if any(ch in p for ch in "*?["):
+            # 支持 glob（`*.log`、`out/*`）——旧版不支持，写 glob 形同没写，且**静默失效**
+            if fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(os.path.basename(rel), p):
+                return True
+            continue
         if rel == p or rel.startswith(p + os.sep):
             return True
     return False

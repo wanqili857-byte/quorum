@@ -105,8 +105,11 @@ class Cluster:
         sims = [_weighted_jaccard(toks[i], toks[j], weight)
                 for i in range(len(toks)) for j in range(i + 1, len(toks))]
         avg = sum(sims) / len(sims) if sims else 0.0
-        if avg < 0.20:
-            return "⚠️ 各家归因可能不同（平均相似度 %.2f）——**逐条读原话**" % avg
+        # 阈值必须落在「同一条发现」的相似度区间**之上**才有区分力。
+        # 标定（见 _tokens）：同一条的两份措辞 0.14–0.21，不同条 ≤0.06。
+        # 旧阈值 0.20 正好落在这个区间里 —— 于是它既报不出真分歧，也拦不住假一致。
+        if avg < 0.30:
+            return "⚠️ 各家归因可能不同（平均相似度 %.2f < 0.30）——**逐条读原话**" % avg
         return "各家措辞接近（平均相似度 %.2f）" % avg
 
     @property
@@ -188,20 +191,21 @@ def cluster(rows: List[Row], thr_same_file: float = 0.07, thr_text: float = 0.10
     for idx, row in enumerate(rows):
         best: Optional[Cluster] = None
         best_score = 0.0
+        best_same_file = False
         for c in clusters:
             if row.reviewer in c.reviewers:
                 continue                      # 同一家的两条不合并（他自己分开写的就是两件事）
             for other_idx in c.members:
-                same_file = bool(_paths(row.location) & _paths(rows[other_idx].location))
+                sf = bool(_paths(row.location) & _paths(rows[other_idx].location))
                 sc = _weighted_jaccard(tokens[idx], tokens[other_idx], weight)
-                if (same_file and sc >= thr_same_file) or sc >= thr_text:
-                    score = sc + (0.05 if same_file else 0.0)
+                if (sf and sc >= thr_same_file) or sc >= thr_text:
+                    score = sc + (0.05 if sf else 0.0)
                     if score > best_score:
-                        best, best_score = c, score
+                        best, best_score, best_same_file = c, score, sf
         if best is not None:
             best.members.append(idx)
             best.rows.append(row)
-            best.why = ("同文件 + 相似度 %.2f" % best_score) if same_file else ("相似度 %.2f" % best_score)
+            best.why = ("同文件 + 相似度 %.2f" % best_score) if best_same_file else ("相似度 %.2f" % best_score)
         else:
             c = Cluster([row])
             c.members = [idx]

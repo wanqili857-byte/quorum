@@ -74,6 +74,8 @@ def cmd_run(a) -> int:
         else:
             stdout_path = tmp_out
 
+        snap = snapshot.take(cfg)      # 每个审核员各自取基线：上一个审核员若改了材料，
+        #                                不该算到这一个头上（旧版全循环共用一份基线，归因是错的）
         ro = channels.readonly_note(cfg.channels[r.channel])
         print("\n── %s（通道 %s · 上限 %ds · 只读: %s）" % (n, r.channel, r.timeout_s, ro))
         if "NOT enforced" in ro:
@@ -107,6 +109,8 @@ def cmd_run(a) -> int:
             gates.protect_existing(fail_path)
             gates.atomic_write(fail_path, text or "（空产出）")
             print("  %s 未过门禁（%s）→ %s" % (FAIL, result.summary(), os.path.relpath(fail_path, cfg.repo)))
+            if result.blocked:
+                print("     ↳ 这多半不是模型不行，而是它的沙箱不够：解封只读工具（或换通道）再跑一次")
             rc_all = 3
         gates.log(cfg, n, result, a.label)
         for f in (tmp_out, tmp_out + ".stream"):
@@ -188,14 +192,17 @@ def cmd_leaks(a) -> int:
             return 1
         print("  %s 全部规则都能抓到自己种的样本，且不误伤安全文本" % OK)
         if not a.dir:
+            print("  （这只证明了**规则本身**有效；扫描覆盖面要传目录才验得了："
+                  "`quorum check-leaks <dir> --self-test`）")
             return 0
 
     if not a.dir:
         print("用法：quorum check-leaks <目录> [--self-test]")
         return 1
     hits = leaks.scan(a.dir, pats, skip_files=(leaks.FIXTURE_FILE,) + tuple(os.path.abspath(x) for x in a.ignore))
-    print(leaks.render(hits, a.dir))
-    return 1 if hits else 0
+    skipped = hits.pop("__skipped__", [])
+    print(leaks.render(hits, a.dir, skipped))
+    return 1 if {k: v for k, v in hits.items() if v} else 0
 
 
 # -------------------------------------------------------------------- main

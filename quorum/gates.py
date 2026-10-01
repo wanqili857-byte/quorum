@@ -24,6 +24,12 @@ from .config import Config
 
 SEVERITY_RE = re.compile(r"🔴|🟡|🟢|\[高\]|\[中\]|\[低\]")
 
+# 「审核员卡住了」与「审核员交了个差结论」在门禁看来长得一样，但处置完全不同：
+# 前者要你解封权限/换通道再跑，后者要重写工单或换模型。这里给前者一个可识别的信号。
+BLOCKED_MARKERS = ("requires approval", "need a decision", "需要你", "需要授权", "无法执行",
+                   "permission denied", "command not allowed", "I cannot proceed",
+                   "blocked", "sandbox")
+
 
 @dataclass
 class GateResult:
@@ -34,8 +40,12 @@ class GateResult:
     rc: int
     seconds: int
     findings: int = 0
+    blocked: bool = False
 
     def summary(self) -> str:
+        if self.blocked:
+            return ("%dB · 审核员疑似**卡住**（未产出发现，输出里有环境/权限类措辞）· rc=%d · %ds"
+                    % (self.size, self.rc, self.seconds))
         return ("%dB · 发现 %d 条（标记 %d）· 缺章节 %s · rc=%d · %ds"
                 % (self.size, self.findings, self.marks,
                    self.missing_sections or "无", self.rc, self.seconds))
@@ -57,7 +67,10 @@ def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
     passed = (len(text.encode()) >= cfg.gates.min_bytes
               and len(rows) >= cfg.gates.min_findings
               and not missing)
-    return GateResult(passed, len(text.encode()), marks, missing, rc, seconds, findings=len(rows))
+    low = text.lower()
+    blocked = (not passed) and len(rows) == 0 and any(m.lower() in low for m in BLOCKED_MARKERS)
+    return GateResult(passed, len(text.encode()), marks, missing, rc, seconds,
+                      findings=len(rows), blocked=blocked)
 
 
 def run_with_timeout(argv: List[str], env: Dict[str, str], timeout_s: int,
@@ -106,8 +119,8 @@ def header(cfg: Config, reviewer_name: str, snapshot_line: str, extra: str = "")
     lines = [
         "# %s · 独立复核结论 · %s · %s" % (cfg.project, reviewer_name, datetime.now().strftime("%Y-%m-%d")),
         "",
-        "> 工单: `%s` · 模型族: `%s` · 角色: `%s`%s"
-        % (cfg.brief, r.family, r.role, (" · " + r.label) if r.label else ""),
+        "> 工单: `%s` · 模型族(声明): `%s` · 角色: `%s` · 通道: `%s`%s"
+        % (cfg.brief, r.family, r.role, r.channel, (" · " + r.label) if r.label else ""),
         "> 方式: 独立进程 headless（干净上下文，与作者会话无共享记忆）",
         snapshot_line,
         "<!-- quorum:snapshot %s -->" % _snap_digest(snapshot_line),
@@ -188,7 +201,8 @@ def _header_map(cells: List[str]) -> Dict[str, int]:
     for i, c in enumerate(cells):
         key = c.strip("*` ").strip()
         for want in COLUMN_NAMES:
-            if key.startswith(want) and len(key) <= len(want) + 6:
+            # 列名后面常带修饰（`严重度（🔴🟡🟢）`、`证据（命令/重算结果）`）——放宽到 +14
+            if key.startswith(want) and len(key) <= len(want) + 14:
                 m.setdefault(want, i)
     return m if len(m) >= 2 and "严重度" in m else {}
 

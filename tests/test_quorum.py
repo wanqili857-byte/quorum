@@ -71,6 +71,58 @@ def test_run_refuses_when_brief_missing(tmp_path):
     assert main(["run", "--config", str(tmp_path / "review.yaml"), "--all"]) == 2
 
 
+def test_config_requires_explicit_family(tmp_path):
+    """family 是 COI 的唯一依据 —— 不写就必须报错。
+
+    （这条用**行为**断言，不用「文件里没有某个字符串」——后者会被解释性注释满足。）
+    """
+    p = tmp_path / "r.yaml"
+    p.write_text(
+        "project: p\nrepo: .\nbrief: b.md\nout_dir: out\n"
+        "channels: {c: {kind: fake, argv: ['true']}}\n"
+        "reviewers:\n"
+        "  - {name: a, channel: c}\n"
+        "  - {name: b, channel: c}\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load(str(p))
+
+
+def test_cli_self_test_can_actually_fail(tmp_path, monkeypatch, capsys):
+    """「检查能不能失败」的检查自己必须能失败。
+
+    旧版 CLI 里有一句 `[f for f in self_test(pats) if "样本" not in f]` ——
+    而失败消息正是「正则抓不到自己种的样本」，于是它把唯一该报的失败**滤掉了**。
+    这里注入一条永远匹配不上的规则，断言 CLI 真的判失败。
+    """
+    from quorum import leaks as leaks_mod
+    real = leaks_mod.default_patterns
+
+    def with_broken(username=""):
+        return real(username) + [leaks_mod.Pattern("故意写坏", r"NEVER_MATCHES_XYZ",
+                                                   "sample", "测试用")]
+
+    monkeypatch.setattr("quorum.leaks.default_patterns", with_broken)
+
+    class A:
+        config = ""
+        username = "x"
+        self_test = True
+        dir = ""
+        self_sample = ""
+        ignore = []
+    assert main.__module__ and True
+    rc = __import__("quorum.cli", fromlist=["cmd_leaks"]).cmd_leaks(A())
+    assert rc == 1, "一条抓不到自己样本的规则必须让 --self-test 失败"
+
+
+def test_demo_ledger_reports_the_expected_verdicts(demo, capsys):
+    """示例台账的四档判定必须真的是那四档（不是靠读注释相信）。"""
+    cfg = os.path.join(demo, "review.yaml")
+    assert main(["verify", "--config", cfg, "--ledger", "ledger_example.md"]) == 1
+    out = capsys.readouterr().out
+    assert "台账说谎 1" in out and "未修 2" in out and "无断言 1" in out
+
+
 def test_config_rejects_same_family_primaries(tmp_path):
     p = tmp_path / "r.yaml"
     p.write_text(
@@ -292,7 +344,9 @@ def test_leak_scan_finds_username_and_secrets(tmp_path):
 
 def test_leak_scan_clean_on_safe_text(tmp_path):
     (tmp_path / "ok.md").write_text("the quick brown fox\n", encoding="utf-8")
-    assert leaks.scan(str(tmp_path), leaks.default_patterns("nobody")) == {}
+    got = {k: v for k, v in leaks.scan(str(tmp_path), leaks.default_patterns("nobody")).items()
+           if k != "__skipped__"}
+    assert got == {}
 
 
 # -------------------------------------------------------------------- e2e
@@ -306,8 +360,13 @@ def test_e2e_demo_full_loop(demo, capsys):
 
     assert main(["plate", "--config", cfg, "--dispose"]) == 0
     text = capsys.readouterr().out
-    assert "跨模型族一致" in text                 # 三家在集群 1 上对齐
-    assert "单家独有" in text                     # gamma 那条错误断言不该被算成一致
+    # 只在**汇总表**里断言：旧版断的是整份文本里出现某串，而 render() 的「读法」一节
+    # 本身就含「单家独有」四个字 —— 那条断言永远为真。
+    summary = text.split("## 明细")[0]
+    assert "跨模型族一致" in summary               # 三家在集群 1 上对齐
+    n_high = summary.count("跨模型族一致")
+    assert n_high == 1, "只有集群 1 该被判为跨模型族一致，实际 %d" % n_high
+    assert summary.count("单家独有") >= 2          # 其余三条各自独立
     assert os.path.exists(os.path.join(demo, "out", "demo-dispose.md"))
 
     assert main(["verify", "--config", cfg, "--ledger", "ledger_example.md"]) == 1
@@ -336,7 +395,8 @@ def test_e2e_material_change_is_flagged(demo, tmp_path, monkeypatch):
 
     def fake_take(c):
         calls["n"] += 1
-        if calls["n"] == 2:                       # 审核结束后那一次：材料已变
+        # 调用序：1) 开跑前的展示 2) 该审核员的基线 3) 审核结束后的对照
+        if calls["n"] == 3:                       # 第 3 次 = 审核之后：材料已变
             with open(touch, "a", encoding="utf-8") as f:
                 f.write("\n<!-- 审核期间被改动 -->\n")
         return real_take(c)
