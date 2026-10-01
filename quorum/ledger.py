@@ -92,26 +92,43 @@ def parse(path: str) -> List[Entry]:
     return entries
 
 
-def _check_env() -> dict:
-    """跑 check 用的环境：把**运行 quorum 的这个解释器**所在目录放到 PATH 最前。
+def _check_env(cwd: str = "") -> dict:
+    r"""跑 check 用的环境。
 
-    事故：`verify` 从头到尾没报错，却把 11 条 ✅ 判成「台账说谎」。真因不是台账说谎，
+    事故一：`verify` 从头到尾没报错，却把 11 条 ✅ 判成「台账说谎」。真因不是台账说谎，
     是 `bash -lc` 继承的 PATH 里没有 `pytest`（quorum 装在 venv 里，venv 没 activate）。
     **同一个仓库、同一份台账，换台机器结论就变**——正是 docs/LESSONS.md 里
     「门禁的结果不该取决于跑它的机器」那一条，只不过这次踩的是自己的 `verify`。
 
-    改法不是往 check 里写死路径（那只是把环境依赖挪个地方），而是让 check 在
-    「quorum 自己运行的那个环境」里跑——这个定义与调用方式无关，可预期。
+    当时的改法是「把**跑 quorum 的那个解释器**的 bin 放到 PATH 最前」。**那只堵了一半**：
+    quorum 以 `uv tool`（隔离 env）安装时，那个 bin 里没有 pytest；
+    而以 `pip install -e '.[dev]'`（CI 的装法）安装时，pytest 恰好同 env，于是 CI 绿、本地红。
+    **同一份台账，CI 判 0 说谎、本地判 12 说谎。**
+
+    现在按优先级拼三段，缺哪段就跳过哪段：
+
+    1. **被审项目自己的** `.venv/bin`——check 要跑的是**项目**的工具（pytest、ruff…），
+       它们该由项目的环境提供，不是由 quorum 的环境提供；
+    2. 跑 quorum 的那个解释器的 bin（`sys.executable`）——保住原来的语义；
+    3. 继承来的 PATH。
+
+    环境仍然可能缺工具，但**缺哪一段是可解释的**：check 写 `pytest`，就该能在
+    项目 venv 里找到；找不到说明这个项目没装 dev 依赖，而不是「门禁看运气」。
     """
     env = dict(os.environ)
-    bindir = os.path.dirname(os.path.abspath(sys.executable))
-    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    parts: List[str] = []
+    if cwd:
+        venv = os.path.join(cwd, ".venv", "bin")
+        if os.path.isdir(venv):
+            parts.append(venv)
+    parts.append(os.path.dirname(os.path.abspath(sys.executable)))
+    env["PATH"] = os.pathsep.join(parts + [env.get("PATH", "")])
     return env
 
 
 def run_checks(entries: List[Entry], cwd: str, timeout_s: int = 120) -> List[Verdict]:
     out: List[Verdict] = []
-    env = _check_env()
+    env = _check_env(cwd)
     for e in entries:
         if not e.check.strip():
             out.append(Verdict(e, False, None, ""))

@@ -17,7 +17,10 @@ import json
 import os
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Dict, List, Tuple
 
 from . import channels, gates, ledger, leaks, plate, snapshot
 from .config import ConfigError, load
@@ -30,6 +33,72 @@ def _hdr(t: str) -> None:
 
 
 # --------------------------------------------------------------------- run
+@dataclass
+class _One:
+    """一个审核员的全部产出。
+
+    **不在这里 print**：并发时几家的进度行会交错成一团，读不出谁是谁。
+    由调用方按批、按审核员顺序原子打印（`console` 就是要打印的行）。
+    """
+    name: str
+    text: str
+    result: gates.GateResult
+    rc: int
+    secs: int
+    ro: str
+    console: List[str] = field(default_factory=list)
+
+
+def _run_one(cfg, name: str, built: Tuple[List[str], Dict[str, str], bool]) -> _One:
+    """跑一个审核员。副作用只落在**它自己的**路径上。
+
+    并发下不串味，靠的是「每样东西每个审核员一份」，三样缺一不可：
+
+    1. 临时文件带自己的前缀（``mkstemp(prefix="quorum-<name>-")``）；
+    2. 结论 ``out_path(name)`` 与原始日志 ``raw_path(name, stamp)`` 都按名字分；
+    3. **不碰 ``os.environ``** —— ``run_with_timeout`` 是 copy 一份再 update，
+       所以两家通道的 env 不会互相渗。谁把某个通道的密钥写进全局环境，这一条就废了。
+
+    这三条同时也是「各条 Agent 的上下文是干净的」在**本进程内**的全部含义：
+    进程之间的干净由「各自起独立进程」保证，不靠这里。
+    """
+    argv, env, writes_file = built
+    r = cfg.reviewer(name)
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    console: List[str] = []
+    kept = gates.protect_existing(cfg.out_path(name))
+    if kept:
+        console.append("已有结论非空 → 先留档为 %s" % os.path.basename(kept))
+
+    fd, tmp_out = tempfile.mkstemp(prefix="quorum-%s-" % name, suffix=".md")
+    os.close(fd)
+    if writes_file:
+        argv = [tmp_out if x == "__OUT__" else x for x in argv]
+        stdout_path = tmp_out + ".stream"
+    else:
+        stdout_path = tmp_out
+
+    ro = channels.readonly_note(cfg.channels[r.channel])
+    console.append("\n── %s（通道 %s · 上限 %ds · 只读: %s）" % (name, r.channel, r.timeout_s, ro))
+    if "NOT enforced" in ro:
+        console.append("   ⚠ 该通道无法在 CLI 层强制只读——只读靠工单措辞，事后由材料快照比对兜底")
+
+    t0 = datetime.now()
+    rc = gates.run_with_timeout(argv, env, r.timeout_s, stdout_path,
+                                cfg.raw_path(name, stamp), cwd=cfg.repo)
+    secs = int((datetime.now() - t0).total_seconds())
+
+    text = gates.read_text(tmp_out)
+    result = gates.evaluate(cfg, text, rc, secs)
+    for f in (tmp_out, tmp_out + ".stream"):
+        try:
+            if os.path.exists(f):
+                os.unlink(f)
+        except OSError:
+            pass
+    return _One(name, text, result, rc, secs, ro, console)
+
+
 def cmd_run(a) -> int:
     cfg = load(a.config)
     want = [r.name for r in cfg.reviewers] if a.all else [a.reviewer]
@@ -43,7 +112,8 @@ def cmd_run(a) -> int:
         return 2
 
     snap = snapshot.take(cfg)
-    print("项目 %s · 审核员 %s" % (cfg.project, ", ".join(want)))
+    jobs = len(want) if int(a.jobs) <= 0 else int(a.jobs)
+    print("项目 %s · 审核员 %s · 并发 %d" % (cfg.project, ", ".join(want), min(jobs, len(want))))
     print("工单：%s" % cfg.brief_for_prompt())
     print(snap.header_line().lstrip("> "))
     if a.dry_run:
@@ -55,70 +125,64 @@ def cmd_run(a) -> int:
         return 0
 
     rc_all = 0
-    for n in want:
-        r = cfg.reviewer(n)
-        out = cfg.out_path(n)
-        stamp = datetime.now().strftime("%Y-%m-%d")
-        raw = cfg.raw_path(n, stamp)
-        kept = gates.protect_existing(out)
-        if kept:
-            print("已有结论非空 → 先留档为 %s" % os.path.basename(kept))
+    for start in range(0, len(want), jobs):
+        chunk = want[start:start + jobs]
 
-        argv, env, writes_file = channels.build(cfg.channels[r.channel], r, cfg,
-                                                channels.build_prompt(cfg, r))
-        fd, tmp_out = tempfile.mkstemp(prefix="quorum-%s-" % n, suffix=".md")
-        os.close(fd)
-        if writes_file:
-            argv = [tmp_out if x == "__OUT__" else x for x in argv]
-            stdout_path = tmp_out + ".stream"
+        # 起进程**之前**把这一批的通道全部解析完。一个通道配错（缺密钥文件、引用了没设的
+        # 环境变量）应当在任何进程启动前就失败——并发放大了「同批其他几家白跑一趟」的代价。
+        prepared: Dict[str, Tuple[List[str], Dict[str, str], bool]] = {}
+        for n in chunk:
+            r = cfg.reviewer(n)
+            prepared[n] = channels.build(cfg.channels[r.channel], r, cfg,
+                                         channels.build_prompt(cfg, r))
+
+        # 快照按**批**取。`--jobs 1` 时一批一家，与旧版「每个审核员前后各取一次」逐字等价；
+        # `--jobs N` 时是批级基线，代价是**归因变粗**：材料变了只知道「这一批里有人改了」，
+        # 不知道是谁。换来的是三家审的是**同一份材料的同一时刻**，而不是先后三份。
+        snap = snapshot.take(cfg)
+        if len(chunk) == 1:
+            ones = [_run_one(cfg, chunk[0], prepared[chunk[0]])]
         else:
-            stdout_path = tmp_out
-
-        snap = snapshot.take(cfg)      # 每个审核员各自取基线：上一个审核员若改了材料，
-        #                                不该算到这一个头上（旧版全循环共用一份基线，归因是错的）
-        ro = channels.readonly_note(cfg.channels[r.channel])
-        print("\n── %s（通道 %s · 上限 %ds · 只读: %s）" % (n, r.channel, r.timeout_s, ro))
-        if "NOT enforced" in ro:
-            print("   ⚠ 该通道无法在 CLI 层强制只读——只读靠工单措辞，事后由材料快照比对兜底")
-        t0 = datetime.now()
-        rc = gates.run_with_timeout(argv, env, r.timeout_s, stdout_path, raw, cwd=cfg.repo)
-        secs = int((datetime.now() - t0).total_seconds())
-
-        text = gates.read_text(tmp_out)
-        result = gates.evaluate(cfg, text, rc, secs)
+            with ThreadPoolExecutor(max_workers=len(chunk)) as ex:
+                ones = list(ex.map(lambda n: _run_one(cfg, n, prepared[n]), chunk))
         snap_after = snapshot.take(cfg)
-        extra = ""
-        if rc != 0:
-            extra = ("进程退出码 %d（信号/异常收尾）。**四道内容门全过即接受**——"
-                     "退出码描述的是进程，不是材料。" % rc) if result.passed else \
-                    "进程退出码 %d，且内容门未过。" % rc
-        if snap_after.digest != snap.digest:
-            extra = (extra + " " if extra else "") + \
-                    "⚠️ **材料在审核期间发生变化**（%s → %s），结论可能对应中间的某个状态。" % (
-                        snap.digest, snap_after.digest)
+        moved = snap_after.digest != snap.digest
 
-        if result.passed:
-            if "NOT enforced" in ro:
-                extra = (extra + " " if extra else "") + "只读强度：未强制（%s）" % ro
-            body = gates.header(cfg, n, snap.header_line(), extra) + text
-            gates.atomic_write(out, body)
-            print("  %s 通过（%s）→ %s" % (OK, result.summary(), os.path.relpath(out, cfg.repo)))
-        else:
-            fail_path = "%s.FAILED-%s.md" % (out[:-3], datetime.now().strftime("%H%M%S"))
-            # 同一分钟内同一个审核员第二次失败会覆盖掉第一份失败产出——失败也要留档（唯一记账入口）
-            gates.protect_existing(fail_path)
-            gates.atomic_write(fail_path, text or "（空产出）")
-            print("  %s 未过门禁（%s）→ %s" % (FAIL, result.summary(), os.path.relpath(fail_path, cfg.repo)))
-            if result.blocked:
-                print("     ↳ 这多半不是模型不行，而是它的沙箱不够：解封只读工具（或换通道）再跑一次")
-            rc_all = 3
-        gates.log(cfg, n, result, a.label)
-        for f in (tmp_out, tmp_out + ".stream"):
-            try:
-                if os.path.exists(f):
-                    os.unlink(f)
-            except OSError:
-                pass
+        for one in ones:
+            for line in one.console:
+                print(line)
+
+            extra = ""
+            if one.rc != 0:
+                extra = ("进程退出码 %d（信号/异常收尾）。**四道内容门全过即接受**——"
+                         "退出码描述的是进程，不是材料。" % one.rc) if one.result.passed else \
+                        "进程退出码 %d，且内容门未过。" % one.rc
+            if moved:
+                who = "该审核员" if len(chunk) == 1 else \
+                      "本批 %d 家（并发，**归不到具体某一家**）" % len(chunk)
+                extra = (extra + " " if extra else "") + \
+                        "⚠️ **材料在审核期间发生变化**（%s → %s），%s 的结论可能对应中间的某个状态。" % (
+                            snap.digest, snap_after.digest, who)
+
+            out = cfg.out_path(one.name)
+            if one.result.passed:
+                if "NOT enforced" in one.ro:
+                    extra = (extra + " " if extra else "") + "只读强度：未强制（%s）" % one.ro
+                body = gates.header(cfg, one.name, snap.header_line(), extra) + one.text
+                gates.atomic_write(out, body)
+                print("  %s 通过（%s）→ %s" % (OK, one.result.summary(),
+                                               os.path.relpath(out, cfg.repo)))
+            else:
+                fail_path = "%s.FAILED-%s.md" % (out[:-3], datetime.now().strftime("%H%M%S"))
+                # 同一分钟内同一个审核员第二次失败会覆盖掉第一份失败产出——失败也要留档（唯一记账入口）
+                gates.protect_existing(fail_path)
+                gates.atomic_write(fail_path, one.text or "（空产出）")
+                print("  %s 未过门禁（%s）→ %s" % (FAIL, one.result.summary(),
+                                                    os.path.relpath(fail_path, cfg.repo)))
+                if one.result.blocked:
+                    print("     ↳ 这多半不是模型不行，而是它的沙箱不够：解封只读工具（或换通道）再跑一次")
+                rc_all = 3
+            gates.log(cfg, one.name, one.result, a.label)
     return rc_all
 
 
@@ -218,6 +282,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--reviewer")
     g.add_argument("--all", action="store_true")
     r.add_argument("--label", default="")
+    r.add_argument("--jobs", type=int, default=0,
+                   help="并发几个审核员（0 = 全部并发；1 = 串行，用于排查）")
     r.add_argument("--dry-run", action="store_true", help="只打印将执行的命令（不需要密钥）")
     r.set_defaults(func=cmd_run)
 

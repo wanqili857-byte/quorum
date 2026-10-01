@@ -3,10 +3,10 @@
 **让几个不同厂商的模型互相挑错，把「审核」从一次性动作变成可证伪的回归。**
 
 ```bash
-quorum run    --config review.yaml --all     # 起独立进程审核（干净上下文）
-quorum plate  --config review.yaml --dispose # 交叉表：一致 / 独有 · 导出处置台账
-quorum verify --config review.yaml           # 跑台账里的断言 → 抓「台账说谎」
-quorum check-leaks .                         # 泄漏自检（公开仓的守门人）
+quorum run    --config review.yaml --all      # 起独立进程审核（干净上下文，默认全部并发）
+quorum plate  --config review.yaml --dispose  # 交叉表：一致 / 独有 · 导出处置台账
+quorum verify --config review.yaml            # 跑台账里的断言 → 抓「台账说谎」
+quorum check-leaks .                          # 泄漏自检（公开仓的守门人）
 ```
 
 ---
@@ -31,6 +31,16 @@ quorum 针对的就是这两件事：**交叉**（谁说的、几家说、两个
 再用一条只验证「我做了那个动作」的命令打成 ✅。**——当天三轮自审加 `verify` 一处都没报出来，
 是用户从工具外面看了一眼配置才发现的。**
 细节与自查方法见 [`docs/LESSONS.md`](docs/LESSONS.md)。
+
+### 并发（`--jobs`）
+
+默认**全部并发**：三个审核员就是三个独立进程，不共享临时文件、结论路径与 env，
+串行跑只是白等。（`--jobs 1` 强制串行，排查时用。）
+
+并发不是没代价，代价是**归因变粗**：材料在审核期间被改动时，串行能指出是**哪一个**审核员
+改的，并发只能说「这一批里有人改了」。换来的是三家审的是**同一份材料的同一时刻**，
+而不是先后三份。这笔账会写进结论头部——并发时那句告警明确写「归不到具体某一家」，
+不许悄悄退化成串行的措辞。
 
 ## 30 秒上手（不需要任何 API key）
 

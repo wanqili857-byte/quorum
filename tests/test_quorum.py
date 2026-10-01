@@ -606,3 +606,159 @@ def test_ledger_row_survives_unclosed_code_span():
     header_cols = len(plate.dispose_skeleton(_C(), [c]).split("\n")[6].split("|")) - 2
     assert len(gates._split_row(row)) == header_cols, \
         "骨架行被切成 %d 格，应为 %d 格：%r" % (len(gates._split_row(row)), header_cols, row[-60:])
+
+
+# ------------------------------------------------------------------ 并发
+# 「并发」不能靠读代码断言，得让进程自己留证据：每个桩把 (起, 止) 写进同一个文件，
+# 跑完看这些区间有没有重叠。串行 → 永不相交；并发 → 必有相交。
+# **两个方向都要测**：只测「并发时相交」的话，那条断言可能只是因为「进程启动本来就重叠」
+# 而通过，而那样它什么都没证明。
+PROBE_PY = '''\
+import os, sys, time
+name = os.environ["PROBE_NAME"]
+t0 = time.time()
+time.sleep(1.0)
+t1 = time.time()
+with open(os.environ["PROBE_TRACE"], "a") as f:
+    f.write("%s %.4f %.4f\\n" % (name, t0, t1))
+sys.stdout.write("""## 第二节 · 逐条发现
+
+| 严重度 | 位置 | 问题 | 证据 |
+|---|---|---|---|
+| 🟡 | `x.py:1` | 探针 %s 报的发现 | 自证 |
+
+## 最脆弱的一环
+
+- 探针
+""" % name)
+'''
+
+
+def _probe_cfg(tmp_path, n=3):
+    """一套最小配置：n 个审核员全走同一个「会留时间戳」的桩。"""
+    d = tmp_path / "j"
+    d.mkdir()
+    (d / "b.md").write_text("# 工单\n\n随便。\n", encoding="utf-8")
+    (d / "probe.py").write_text(PROBE_PY, encoding="utf-8")
+    trace = d / "trace.txt"
+    lines = ["project: j", "repo: .", "brief: b.md", "out_dir: out", 'sources: ["."]',
+             "channels:", "  probe:", "    kind: fake", '    argv: ["python3", "probe.py"]',
+             "reviewers:"]
+    for i in range(n):
+        lines.append("  - {name: r%d, channel: probe, vendor: v%d, role: primary,"
+                     " env: {PROBE_NAME: r%d, PROBE_TRACE: %s}}" % (i, i, i, trace))
+    lines.append('gates: {min_bytes: 10, min_findings: 1, require_sections: ["最脆弱"]}')
+    (d / "review.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(d / "review.yaml"), str(trace)
+
+
+def _intervals(trace):
+    out = []
+    for line in open(trace):
+        p = line.split()
+        if len(p) == 3:
+            out.append((p[0], float(p[1]), float(p[2])))
+    return out
+
+
+def _overlaps(iv):
+    return [(iv[i], iv[j]) for i in range(len(iv)) for j in range(i + 1, len(iv))
+            if iv[i][1] < iv[j][2] and iv[j][1] < iv[i][2]]
+
+
+def test_jobs_runs_concurrently(tmp_path):
+    """`--jobs 0`（= 全部并发）必须**真的**并发跑。"""
+    cfg, trace = _probe_cfg(tmp_path)
+    main(["run", "--config", cfg, "--all", "--jobs", "0"])
+    iv = _intervals(trace)
+    assert len(iv) == 3, "三个审核员都该留下时间戳，实际 %r" % (iv,)
+    assert _overlaps(iv), "三家之间没有任何执行区间重叠——它们其实是串行跑完的：%r" % (iv,)
+
+
+def test_jobs_1_is_serial_negative_control(tmp_path):
+    """阴性对照：`--jobs 1` 时**不许**有时间重叠。
+
+    没有这一条，上面那个测试可能只是因为「进程启动本来就重叠」而通过，什么都证明不了。
+    """
+    cfg, trace = _probe_cfg(tmp_path)
+    main(["run", "--config", cfg, "--all", "--jobs", "1"])
+    iv = _intervals(trace)
+    assert len(iv) == 3
+    assert not _overlaps(iv), "声称串行，却出现了时间重叠：%r" % (_overlaps(iv),)
+
+
+def test_jobs_keeps_each_reviewers_output_separate(demo):
+    """并发不许串味：每个审核员的结论里只有**它自己**的内容。
+
+    「上下文干净」在 quorum 里是两层：进程之间靠「各起独立进程」；进程内靠
+    「临时文件 / 结论路径 / env 都不共享」。这条测的是后者在产物上留下的痕迹。
+    """
+    cfg = os.path.join(demo, "review.yaml")
+    main(["run", "--config", cfg, "--all", "--jobs", "0"])
+    mine = {"alpha": "分母不是 100", "beta": "重跑可复现", "gamma": "报告数字可重算"}
+    for n, marker in mine.items():
+        text = open(os.path.join(demo, "out", "demo-findings-%s.md" % n), encoding="utf-8").read()
+        assert marker in text, "%s 的结论里没有它自己的内容（%r）" % (n, marker)
+        for other, om in mine.items():
+            if other != n:
+                assert om not in text, "%s 的结论里混进了 %s 的内容（%r）" % (n, other, om)
+
+
+def test_jobs_does_not_change_the_conclusions(demo):
+    """并发只改**怎么跑**，不改**跑出什么**：同一份材料，串行与并发逐字节相同。"""
+    cfg = os.path.join(demo, "review.yaml")
+    names = ["alpha", "beta", "gamma"]
+    paths = {n: os.path.join(demo, "out", "demo-findings-%s.md" % n) for n in names}
+
+    main(["run", "--config", cfg, "--all", "--jobs", "1"])
+    serial = {n: open(paths[n], encoding="utf-8").read() for n in names}
+    for n in names:
+        os.unlink(paths[n])
+
+    main(["run", "--config", cfg, "--all", "--jobs", "0"])
+    for n in names:
+        assert open(paths[n], encoding="utf-8").read() == serial[n], \
+            "%s：串行与并发产出不一致——并发改变了结果，而不只是速度" % n
+
+
+def test_jobs_negative_warns_without_attribution(tmp_path):
+    """`--jobs>1` 时材料被改：告警**照发**，但必须注明归不到具体某一家。
+
+    并发拿「谁改的」换来了「三家审的是同一时刻的材料」。那就得把这笔账说出来——
+    不能悄悄退化成「什么都没发生」，那是本项目最反对的那种静默。
+    """
+    cfg, _ = _probe_cfg(tmp_path)
+    d = os.path.dirname(cfg)
+    with open(os.path.join(d, "probe.py"), "w", encoding="utf-8") as f:
+        f.write(PROBE_PY.replace(
+            "t1 = time.time()",
+            't1 = time.time()\n'
+            'open(os.path.join(os.path.dirname(os.environ["PROBE_TRACE"]), "b.md"),'
+            ' "a").write("\\n<!-- 改动 -->\\n")'))
+    main(["run", "--config", cfg, "--all", "--jobs", "0"])
+    text = open(os.path.join(d, "out", "j-findings-r0.md"), encoding="utf-8").read()
+    assert "材料在审核期间发生变化" in text, "材料被改了却没告警"
+    assert "归不到具体某一家" in text, \
+        "并发下必须说明归因已失效，而不是照抄串行那句「该审核员」"
+
+
+# ------------------------------------------------------------ verify 的环境
+def test_check_env_prefers_the_project_venv(tmp_path):
+    """check 的环境必须认**被审项目**的 venv，不能只认 quorum 自己的。
+
+    真实事故：同一份台账，CI 判「说谎 **0**」、本地判「说谎 **12**」——
+    差别只在 quorum 是**怎么装上去的**（CI 是 `pip install -e '.[dev]'`，pytest 与 quorum
+    同 env；本地是 `uv tool install`，隔离 env 里没有 pytest）。两个都不是真相。
+    """
+    d = tmp_path / "proj"
+    (d / ".venv" / "bin").mkdir(parents=True)
+    first = ledger._check_env(str(d))["PATH"].split(os.pathsep)[0]
+    assert first == str(d / ".venv" / "bin"), "项目自己的 venv 必须排在 PATH 最前"
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    parts = ledger._check_env(str(bare))["PATH"].split(os.pathsep)
+    assert not any(p.endswith(os.path.join(".venv", "bin")) for p in parts), \
+        "没有 .venv 时不许往 PATH 里塞一个不存在的目录"
+    assert parts[0] == os.path.dirname(os.path.abspath(sys.executable)), \
+        "没有项目 venv 时退回旧语义：用跑 quorum 的那个解释器"
