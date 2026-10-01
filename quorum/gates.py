@@ -119,8 +119,11 @@ def header(cfg: Config, reviewer_name: str, snapshot_line: str, extra: str = "")
     lines = [
         "# %s · 独立复核结论 · %s · %s" % (cfg.project, reviewer_name, datetime.now().strftime("%Y-%m-%d")),
         "",
-        "> 工单: `%s` · 模型族(声明): `%s` · 角色: `%s` · 通道: `%s`%s"
-        % (cfg.brief, r.family, r.role, r.channel, (" · " + r.label) if r.label else ""),
+        # 两个来源轴都记进头部。vendor 是**声明**（工具验证不了），harness 是**事实**；
+        # 事后有人要核对「这三家『不同源』到底是不是真的」，读这一行。
+        "> 工单: `%s` · 模型来源(声明): `%s` · agent 框架: `%s` · 角色: `%s` · 通道: `%s`%s"
+        % (cfg.brief, r.vendor, r.harness, r.role, r.channel,
+           (" · " + r.label) if r.label else ""),
         "> 方式: 独立进程 headless（干净上下文，与作者会话无共享记忆）",
         snapshot_line,
         "<!-- quorum:snapshot %s -->" % _snap_digest(snapshot_line),

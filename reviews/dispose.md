@@ -11,7 +11,7 @@
 |---|---|---|---|---|---|---|---|
 | 1 | 跨模型族一致 | 🔴 | `cli.py` dispose | `plate --dispose` 裸 `open(path,"w")`，会原地截断用户填好的台账 | 改为 `protect_existing` + `atomic_write` | `pytest -q tests/test_quorum.py::test_dispose_protects_existing_ledger` | ✅ |
 | 2 | 跨模型族一致 | 🔴 | `plate.py` | CONTRACT 说 cross 不计入「跨模型族一致」，代码里 `role` 从未被读 | `Cluster.primary_families` 只看 primary | `pytest -q tests/test_quorum.py::test_plate_ignores_cross_role_for_confidence` | ✅ |
-| 3 | 跨模型族一致 | 🔴 | `config.py` | `family` 缺省 `"unknown"` 被 COI 校验豁免 → 三个 primary 不写 family 即可全过 | 缺 family 直接报错 | `pytest -q tests/test_quorum.py::test_config_requires_explicit_family` | ✅ |
+| 3 | 跨模型族一致 | 🔴 | `config.py` | `family` 缺省 `"unknown"` 被 COI 校验豁免 → 三个 primary 不写 family 即可全过 | 缺 family 直接报错 | `pytest -q tests/test_quorum.py::test_config_requires_explicit_vendor` | ✅ |
 | 4 | 跨模型族一致 | 🔴 | `leaks.py` | 只扫 `git ls-files` 跟踪文件 → 未跟踪但即将提交的 `.env` 不扫 | 加 `--others --exclude-standard` | `grep -q -- '--others' quorum/leaks.py` | ✅ |
 | 5 | 跨模型族一致 | 🔴 | `ledger.py` | 台账用裸 `split("\|")`，与发现表两个切分器 | 复用 `gates._split_row` | `grep -q '_split_row' quorum/ledger.py` | ✅ |
 | 6 | 跨模型族一致 | 🔴 | `gates.py` | 门禁数 emoji 出现次数而不是发现条数 | 数解析出的发现行，且要求 problem ≥ 8 字 | `pytest -q tests/test_quorum.py::test_gate_counts_findings_not_emoji_spam` | ✅ |
@@ -28,7 +28,11 @@
 | 17 | 单家独有 | 🟢 | `demo/ledger_example.md` | 示例台账里的 check 是**装饰性**的（掏空正文照样通过） | 换成判别性断言，并写清工具抓不到这一类 | `pytest -q tests/test_quorum.py::test_demo_ledger_reports_the_expected_verdicts` | ✅ |
 | 18 | 单家独有 | 🟢 | `README.md` `CONTRACT.md` | 代码体量的说法互不一致，且写死了会漂的数字 | 改成不写死 | `! grep -qE '两百来行\|引擎约 [0-9]+ 行' README.md CONTRACT.md` | ✅ |
 | 19 | 单家独有 | 🟡 | `cli.py` `gates.py` | 「审核员卡住了」与「交了个差结论」在门禁看来一样 | 加 blocked 识别与针对性提示 | `grep -q 'BLOCKED_MARKERS' quorum/gates.py` | ✅ |
-| 20 | — | — | `demo/review.yaml` | COI 校验的是标签不是来源（三个「不同族」实际同一个通道） | 无法自动识别，改为**把通道名记进结论头部**并在 CONTRACT 写明 | `grep -q '模型族(声明)' quorum/gates.py` | ✅ |
+| 20 | — | — | `demo/review.yaml` | COI 校验的是标签不是来源（三个「不同族」实际同一个通道） | 无法自动识别，改为**把通道名记进结论头部**并在 CONTRACT 写明 | `grep -q '模型来源(声明)' quorum/gates.py` | ✅ |
+| 21 | 真实使用发现 | 🟡 | `leaks.py` `cli.py` | 启发式规则 `~/<任意词>/` 把 `~/workspace/` 等正当占位符判成泄漏 → 假警报淹没真警报 | 规则分 `fail`/`warn` 两档，退出码只看 fail；README 写明「rc=0 ≠ 干净」 | `pytest -q tests/test_quorum.py::test_leak_scan_finds_username_and_secrets` | ✅ |
+| 22 | 用户复核发现 | 🔴 | `config.py` `plate.py` | 两个独立的来源轴（模型 vendor / agent harness）被压成一个 `family` 字段；两家 vendor 同走一个 harness 时打出「跨模型族一致」而读者以为买到两维独立 | 拆成两轴：`vendor`（声明）+ `harness`（事实，从通道推出）；`plate` 两轴都报，同 harness 加注记不降级 | `pytest -q tests/test_quorum.py::test_plate_annotates_shared_harness tests/test_quorum.py::test_plate_annotates_same_vendor_two_harnesses tests/test_quorum.py::test_plate_reports_full_independence_when_both_axes_span` | ✅ |
+| 23 | 用户复核发现 | 🔴 | `channels.py` | `kind` 是封闭枚举（claude-cli / codex-cli / fake）→ 想接别的 CLI 必须改库源码，「harness 可自定义」是空话 | 新增通用 `kind: exec`（argv + `{prompt}`/`{repo}`/`{out}` 占位符） | `pytest -q tests/test_quorum.py::test_exec_channel_lets_you_plug_in_any_cli` | ✅ |
+| 24 | 用户复核发现 | 🟡 | `templates/review.yaml` | 模板里写死真实厂商名与真实端点，且用着过期的门禁键名 `min_severity_marks` | 模板改占位符；例子挪进 `examples/` 并标注「这是例子，不是全部选项」 | `! grep -qE 'moonshot\|dashscope\|kimi-k2\|min_severity_marks' templates/review.yaml` | ✅ |
 
 ## 写这份台账时自己踩的坑（留档）
 

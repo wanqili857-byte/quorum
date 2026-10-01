@@ -39,7 +39,7 @@ def test_config_paths_are_config_relative(tmp_path):
     (d / "review.yaml").write_text(
         "project: p\nrepo: .\nbrief: b.md\nout_dir: out\n"
         "channels: {c: {kind: fake, argv: ['true']}}\n"
-        "reviewers: [{name: r, channel: c, family: f}]\n", encoding="utf-8")
+        "reviewers: [{name: r, channel: c, vendor: v}]\n", encoding="utf-8")
     cfg = load(str(d / "review.yaml"))
     assert cfg.repo == str(d.resolve()) or cfg.repo == str(d)
 
@@ -56,7 +56,7 @@ def test_brief_and_outdir_are_config_relative(tmp_path):
     (d / "review.yaml").write_text(
         "project: p\nrepo: ..\nbrief: brief.md\nout_dir: out\n"
         "channels: {c: {kind: fake, argv: ['true']}}\n"
-        "reviewers: [{name: r, channel: c, family: f}]\n", encoding="utf-8")
+        "reviewers: [{name: r, channel: c, vendor: v}]\n", encoding="utf-8")
     cfg = load(str(d / "review.yaml"))
     assert cfg.brief_abs == str(d / "brief.md") and os.path.exists(cfg.brief_abs)
     assert cfg.out_dir_abs == str(d / "out")
@@ -67,12 +67,12 @@ def test_run_refuses_when_brief_missing(tmp_path):
     (tmp_path / "review.yaml").write_text(
         "project: p\nrepo: .\nbrief: nope.md\nout_dir: out\n"
         "channels: {c: {kind: fake, argv: ['true']}}\n"
-        "reviewers: [{name: r, channel: c, family: f}]\n", encoding="utf-8")
+        "reviewers: [{name: r, channel: c, vendor: v}]\n", encoding="utf-8")
     assert main(["run", "--config", str(tmp_path / "review.yaml"), "--all"]) == 2
 
 
-def test_config_requires_explicit_family(tmp_path):
-    """family 是 COI 的唯一依据 —— 不写就必须报错。
+def test_config_requires_explicit_vendor(tmp_path):
+    """vendor 是 COI 的唯一依据 —— 不写就必须报错。
 
     （这条用**行为**断言，不用「文件里没有某个字符串」——后者会被解释性注释满足。）
     """
@@ -123,27 +123,81 @@ def test_demo_ledger_reports_the_expected_verdicts(demo, capsys):
     assert "台账说谎 1" in out and "未修 2" in out and "无断言 1" in out
 
 
-def test_config_rejects_same_family_primaries(tmp_path):
+def test_config_rejects_same_vendor_primaries(tmp_path):
     p = tmp_path / "r.yaml"
     p.write_text(
         "project: p\nrepo: .\nbrief: b.md\nout_dir: out\n"
         "channels: {c: {kind: fake, argv: ['true']}}\n"
         "reviewers:\n"
-        "  - {name: a, channel: c, family: same}\n"
-        "  - {name: b, channel: c, family: same}\n", encoding="utf-8")
+        "  - {name: a, channel: c, vendor: same}\n"
+        "  - {name: b, channel: c, vendor: same}\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load(str(p))
 
 
-def test_config_allows_cross_role_in_same_family(tmp_path):
+def test_config_allows_cross_role_in_same_vendor(tmp_path):
     p = tmp_path / "r.yaml"
     p.write_text(
         "project: p\nrepo: .\nbrief: b.md\nout_dir: out\n"
         "channels: {c: {kind: fake, argv: ['true']}}\n"
         "reviewers:\n"
-        "  - {name: a, channel: c, family: same}\n"
-        "  - {name: b, channel: c, family: same, role: cross}\n", encoding="utf-8")
+        "  - {name: a, channel: c, vendor: same}\n"
+        "  - {name: b, channel: c, vendor: same, role: cross}\n", encoding="utf-8")
     assert len(load(str(p)).reviewers) == 2
+
+
+def test_family_is_accepted_as_legacy_alias_for_vendor(tmp_path):
+    """`family` 是 vendor 的旧名。老配置不能因为改名就跑不起来。"""
+    p = tmp_path / "r.yaml"
+    p.write_text(
+        "project: p\nrepo: .\nbrief: b.md\nout_dir: out\n"
+        "channels: {c: {kind: fake, argv: ['true']}}\n"
+        "reviewers: [{name: a, channel: c, family: moonshot}]\n", encoding="utf-8")
+    assert load(str(p)).reviewers[0].vendor == "moonshot"
+
+
+def test_harness_is_derived_from_channel_not_declared(tmp_path):
+    """harness 是**事实**（从通道推出），不是审核员自己声明的。
+
+    这条是本次改动的核心：两个轴必须能分开。同一 vendor 挂两个通道 = 两个 harness；
+    同一通道挂两个 vendor = 一个 harness。
+    """
+    p = tmp_path / "r.yaml"
+    p.write_text(
+        "project: p\nrepo: .\nbrief: b.md\nout_dir: out\n"
+        "channels:\n"
+        "  c1: {kind: exec, argv: ['x', '{prompt}']}\n"
+        "  c2: {kind: exec, argv: ['y', '{prompt}'], harness: wrapped-y}\n"
+        "reviewers:\n"
+        "  - {name: a, channel: c1, vendor: va}\n"
+        "  - {name: b, channel: c1, vendor: vb}\n"
+        "  - {name: c, channel: c2, vendor: vb, role: cross}\n", encoding="utf-8")
+    rs = {r.name: r for r in load(str(p)).reviewers}
+    assert rs["a"].harness == "exec" and rs["b"].harness == "exec"   # 同通道 → 同 harness
+    assert rs["c"].harness == "wrapped-y"                            # 可覆盖
+    assert rs["a"].vendor == "va" and rs["b"].vendor == "vb"         # vendor 各自独立
+    # harness 不是从 vendor 推的：a/b 同 harness 不同 vendor，b/c 同 vendor 不同 harness
+    assert rs["a"].harness == rs["b"].harness and rs["a"].vendor != rs["b"].vendor
+    assert rs["b"].vendor == rs["c"].vendor and rs["b"].harness != rs["c"].harness
+
+
+def test_exec_channel_lets_you_plug_in_any_cli(tmp_path):
+    """`exec` 是 DIY 的入口：任何 CLI 都能接，不需要改库源码。
+
+    只有 claude-cli / codex-cli 两种内置起法时，harness 维度就是封闭枚举 ——
+    想接 aider / gemini-cli / 自己写的脚本必须改源码，那样「harness 可自定义」是空话。
+    """
+    from quorum import channels
+    from quorum.config import Channel, Config, Reviewer
+    ch = Channel("c", "exec", argv=["my-agent", "--read-only", "-C", "{repo}",
+                                    "-o", "{out}", "{prompt}"])
+    cfg = Config(project="p", brief="b", out_dir="o", repo="/tmp/repo",
+                 reviewers=[], channels={}, gates=None)
+    argv, env, writes = channels.build(ch, Reviewer("r", "c"), cfg, "PROMPT")
+    assert argv == ["my-agent", "--read-only", "-C", "/tmp/repo",
+                    "-o", "{out}", "PROMPT"]
+    assert writes is True                      # argv 里有 {out} → CLI 自己写结论文件
+    assert "exec" in channels.READONLY         # 只读强度必须显式说明（这里是「未知」）
 
 
 def test_env_file_indirection_keeps_secret_out_of_config(tmp_path):
@@ -247,30 +301,63 @@ def test_snapshot_changes_when_material_changes(tmp_path):
 
 
 # ------------------------------------------------------------------ 交叉表
+# Row 的签名是 (reviewer, vendor, harness, severity, location, problem, evidence, role)。
+# 两条轴都必填——旧版只有 vendor 一条，于是「两家同一个 harness」和「两家同一个模型来源」
+# 在数据上长得一模一样，读表的人分不出来。
 def test_plate_merges_same_finding_across_reviewers():
     rows = [
-        plate.Row("a", "fa", "🔴", "`report.md` 的 METRICS", "分母静默缩水：报 100 条但预测只有 41 条", ""),
-        plate.Row("b", "fb", "🔴", "`report.md`", "报表分母与预测不一致：报 100 条实测 41 条", ""),
+        plate.Row("a", "fa", "h1", "🔴", "`report.md` 的 METRICS", "分母静默缩水：报 100 条但预测只有 41 条", ""),
+        plate.Row("b", "fb", "h2", "🔴", "`report.md`", "报表分母与预测不一致：报 100 条实测 41 条", ""),
     ]
     cs = plate.cluster(rows)
-    assert len(cs) == 1 and len(cs[0].families) == 2
+    assert len(cs) == 1 and len(cs[0].vendors) == 2 and len(cs[0].harnesses) == 2
 
 
 def test_plate_keeps_unrelated_findings_apart():
     rows = [
-        plate.Row("a", "fa", "🔴", "`report.md`", "分母静默缩水", ""),
-        plate.Row("b", "fb", "🟡", "`build.py`", "切分不可复现：遍历 set 导致哈希随机化", ""),
+        plate.Row("a", "fa", "h1", "🔴", "`report.md`", "分母静默缩水", ""),
+        plate.Row("b", "fb", "h2", "🟡", "`build.py`", "切分不可复现：遍历 set 导致哈希随机化", ""),
     ]
     assert len(plate.cluster(rows)) == 2
 
 
 def test_plate_never_merges_two_rows_from_same_reviewer():
     rows = [
-        plate.Row("a", "fa", "🔴", "`report.md`", "分母静默缩水", ""),
-        plate.Row("a", "fa", "🟡", "`report.md`", "分母静默缩水", ""),
+        plate.Row("a", "fa", "h1", "🔴", "`report.md`", "分母静默缩水", ""),
+        plate.Row("a", "fa", "h1", "🟡", "`report.md`", "分母静默缩水", ""),
     ]
     cs = plate.cluster(rows)
     assert len(cs) == 2
+
+
+def test_plate_annotates_shared_harness():
+    """两家 vendor 不同但同走一个 harness：一致可能来自 harness，必须注记。
+
+    这是本次改动的**核心理由**。真实配置里 kimi 与 qwen 是两个 vendor，
+    但都走 claude-cli —— 旧版打出「跨模型族一致 · 高置信」，读者会以为买到了两维独立。
+    注记**不降级**：模型层的独立是真的，抹掉是过度惩罚。
+    """
+    rows = [plate.Row("a", "moonshot", "claude-cli", "🔴", "x.md", "同一个问题", ""),
+            plate.Row("b", "qwen", "claude-cli", "🔴", "x.md", "同一个问题", "")]
+    lab = plate.cluster(rows)[0].label()
+    assert lab.startswith("跨模型族一致")            # 不降级
+    assert "claude-cli" in lab and "共识可能来自 harness" in lab   # 但注记
+
+
+def test_plate_annotates_same_vendor_two_harnesses():
+    """反向的不独立：换 harness 不换模型 —— 盲区还是共享的。"""
+    rows = [plate.Row("a", "moonshot", "claude-cli", "🔴", "x.md", "同一个问题", ""),
+            plate.Row("b", "moonshot", "codex-cli", "🔴", "x.md", "同一个问题", "")]
+    lab = plate.cluster(rows)[0].label()
+    assert "同一 vendor" in lab and "同权重同盲区" in lab
+
+
+def test_plate_reports_full_independence_when_both_axes_span():
+    """两轴都跨才是真的「两个独立来源互相印证」。"""
+    rows = [plate.Row("a", "moonshot", "claude-cli", "🔴", "x.md", "同一个问题", ""),
+            plate.Row("b", "qwen", "codex-cli", "🔴", "x.md", "同一个问题", "")]
+    lab = plate.cluster(rows)[0].label()
+    assert "两轴皆跨" in lab
 
 
 # ------------------------------------------------------------------ 处置
@@ -294,10 +381,10 @@ def test_ledger_verdicts(tmp_path):
 # ------------------------------------------------------------------ 泄漏
 def test_plate_ignores_cross_role_for_confidence():
     """CONTRACT：cross 的结论不计入「跨模型族一致」。"""
-    rows = [plate.Row("a", "fa", "🔴", "x.md", "同一个问题", "e", "primary"),
-            plate.Row("b", "fb", "🔴", "x.md", "同一个问题", "e", "cross")]
+    rows = [plate.Row("a", "fa", "h1", "🔴", "x.md", "同一个问题", "e", "primary"),
+            plate.Row("b", "fb", "h2", "🔴", "x.md", "同一个问题", "e", "cross")]
     c = plate.cluster(rows)[0]
-    assert c.label().startswith("含交叉")          # 只有一个 primary family
+    assert c.label().startswith("含交叉")          # 只有一个 primary vendor
     rows[1].role = "primary"
     assert plate.cluster(rows)[0].label().startswith("跨模型族一致")
 

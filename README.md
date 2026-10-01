@@ -53,23 +53,60 @@ ledger: reviews/dispose.md    # 处置台账（verify 读它）
 sources: ["src", "data", "reports"]     # 材料快照指纹覆盖这些路径
 
 channels:
-  ark:                                    # 任何 Anthropic 兼容端点都能接
-    kind: claude-cli
-    model: kimi-k2.7-code
+  ark:
+    kind: claude-cli                        # 任何 Anthropic 兼容端点都能接
+    model: <该端点支持的模型名>
     env:
-      ANTHROPIC_BASE_URL: https://ark.cn-beijing.volces.com/api/coding
-      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/ark_key   # 密钥只给路径，内容不进配置
+      ANTHROPIC_BASE_URL: https://<你的端点>
+      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/<密钥文件>   # 密钥只给路径，内容不进配置
   codex:
     kind: codex-cli
+  any-cli:
+    kind: exec                              # 任何别的 CLI，不用改库源码
+    harness: my-agent                       # exec 必须自己起 harness 名
+    argv: ["my-agent", "--read-only", "-C", "{repo}", "-p", "{prompt}"]
 
 reviewers:
-  - {name: kimi,  channel: ark,   family: moonshot, role: primary}
-  - {name: qwen,  channel: ark,   family: qwen,     role: primary}
-  - {name: codex, channel: codex, family: deepseek, role: cross}
+  - {name: a, channel: ark,     vendor: <模型来源A>, role: primary}
+  - {name: b, channel: any-cli, vendor: <模型来源B>, role: primary}
+  - {name: c, channel: codex,   vendor: <模型来源C>, role: cross}
 ```
 
-`family` 是 COI 规则的载体：**同一 family 不能有两个 primary**——同源模型看不出同源的盲区。
-配置违反这条会直接报错。
+### 两条来源轴，别把它们混成一个
+
+交叉审计的价值来自**失效模式独立**。而独立有两种，是**两件事**：
+
+| 轴 | 是什么 | 性质 | 不同意味着 |
+|---|---|---|---|
+| `vendor` | **模型来源**：谁训的权重 | **声明**（工具验证不了） | 训练数据/偏见的盲区不同 |
+| `harness` | **agent 框架**：哪个 CLI 在跑它 | **事实**（从 channel 推出） | 怎么读材料、怎么找证据、怎么下结论不同 |
+
+**只跨一个轴是不够的**，两个方向都会骗到自己：
+
+- 两个 vendor 走**同一个 harness** → 它们的共识可能来自那套 loop（同一 system prompt、
+  同一工具、同一种「读文件—找证据—列表格」的套路），不是来自两个独立模型。
+- 同一个 vendor 换 harness → 换外壳不换模型，**盲区还是共享的**。
+
+所以 `plate` 两个轴都报，并在表头注记：
+
+```
+> ⚠️ primary 的 vendor 不同，但全走同一个 harness（`claude-cli`）——
+>   它们的一致可能来自 harness，而非来自两个独立模型。
+```
+
+注记**不降级**——模型层的独立是真的，抹掉是过度惩罚。它只是告诉你这次的一致性值多少。
+
+`vendor` 是 COI 规则的载体：**同一 vendor 不能有两个 primary**（同源模型看不出同源的盲区），
+配置违反会直接报错。
+
+### 模型和 harness 都是你自己接的
+
+**quorum 不自带任何模型，也不自带任何 harness。** `kind` 描述的是「怎么起一个进程」——
+`claude-cli` / `codex-cli` 只是两种内置起法，`exec` 是通用入口（自己写 argv，接任何 CLI），
+`fake` 是测试桩。底下跑谁的模型、用哪个 agent CLI，由**你的配置**决定，工具不解释也不验证。
+
+库代码里没有任何厂商名；上面的 `<模型来源A>` 与 README 里出现的例子都只是例子，不是选项全集。
+详见 [`examples/`](examples/)。
 
 ## 四条契约
 
@@ -83,7 +120,29 @@ reviewers:
 | **输出** | 严重度表（每条带「我怎么查出来的」）+ 最脆弱一环 + 附录「推翻了什么」 |
 | **处置** | 台账每行可挂一条 `check` 断言；`verify` 跑它 |
 
-## 它不是什么
+## 泄漏自检：退出码不等于「干净」
+
+```bash
+quorum check-leaks .
+```
+
+**规则分两档，只有 `fail` 档决定退出码：**
+
+| 档 | 是什么 | 退出码 |
+|---|---|---|
+| `fail` | **确定性**形状：凭证、私钥、邮箱、路径里出现本机用户名 | 非零 |
+| `warn` | **启发式**：`~/<任意词>/` 这类。没有语法办法区分「人名」和「目录名」 | 不影响 |
+
+所以 **`rc=0` 只意味着「没有 `fail` 档命中」**——`warn` 档里完全可能躺着真泄漏。
+提示行会标「（提示，不判定失败）」，**必须读输出正文，别只看退出码**。
+
+为什么这么切：扫一个真实仓库时，`~/<任意词>/` 把 `~/workspace/`、`~/bench-runs/`
+这类**正当占位符**判成了泄漏。**假警报淹没真警报，比少一条规则更糟**——你会先学会无视它。
+但也不能干脆删掉这条规则：人名目录混在里面时它是唯一的线索。降档是唯一诚实的做法。
+
+`--self-test` 会给每条规则**种一个样本**并断言它能被抓到——**自检本身必须能失败**。
+
+
 
 - **不是「多跑几个模型」的包装。** 价值在交叉与可证伪，不在并发。单个模型 + 人审在很多场景更划算。
 - **不保证审核员是对的。** 交叉能提高信噪比，不能消除错误。`plate` 的输出里「单家独有」**必须人工复验**。
@@ -112,12 +171,12 @@ quorum 被它自己审过三轮 —— 三个真通道（kimi / qwen / codex）�
 | `reviews/brief.md` | 自审工单（按「声明」组织，不是按文件） |
 | `reviews/review.yaml` | 真通道配置（三个不同模型族） |
 | `reviews/rounds/` | 三轮的原始结论 + 交叉表（含一件缺件的如实说明） |
-| `reviews/dispose.md` | 处置台账，**20 条带可执行断言** |
+| `reviews/dispose.md` | 处置台账，**24 条带可执行断言** |
 
 跑一下：
 
 ```bash
-quorum verify --config reviews/review.yaml     # 20 条断言，全部会真跑
+quorum verify --config reviews/review.yaml     # 24 条断言，全部会真跑
 ```
 
 三轮里抓到的都是「作者看不见自己」的那一类，摘三条最有代表性的：

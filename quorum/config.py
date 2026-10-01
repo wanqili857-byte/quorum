@@ -30,14 +30,25 @@ def _expand(p: Optional[str]) -> Optional[str]:
 
 @dataclass
 class Reviewer:
-    """一个审核员 = 一个「干净进程」+ 一个模型族标记。
+    """一个审核员 = 一个「干净进程」+ **两个互相独立的来源轴**。
 
-    `family` 是 COI 规则的基础：同一 family 的模型不能同时充当首选审核员，
-    只能作交叉（同源模型看不出同源的盲区）。
+    这两条轴不是一回事，别把它们混成一个。真实教训：三家审核员里，两家是**同一个
+    harness 配不同厂的模型**、一家是**另一个 harness**。并排写成「三个不同通道」，
+    读者会以为买到了两维独立，实际只有一维。
+
+    - ``vendor``  —— **模型来源**（谁训的权重）。这是**声明**，工具验证不了真假。
+      COI 规则建在它上面：同一 vendor 不得有两个 primary（同源模型看不出同源盲区）。
+    - ``harness`` —— **agent 框架**（哪个 CLI 在跑它）。这是**事实**，从通道推出，
+      不由审核员声明。
+
+    同一个 vendor 换 harness，模型盲区还是共享的；同一个 harness 换 vendor，
+    共识又可能来自 harness 本身（同一套 system prompt、同一套工具、同一种下结论的套路）。
+    两轴都报出来，读者才知道这次的一致性值多少——见 ``plate.Cluster.label``。
     """
     name: str
     channel: str
-    family: str = "unknown"
+    vendor: str = "unknown"
+    harness: str = ""              # 由通道推出（见 load），不从配置里读
     role: str = "primary"          # primary | cross
     label: str = ""
     timeout_s: int = 2700
@@ -46,13 +57,24 @@ class Reviewer:
 
 @dataclass
 class Channel:
-    """怎么起一个进程。`kind` 决定命令构造方式。"""
+    """怎么起一个进程。`kind` 决定命令构造方式。
+
+    ``kind`` 描述的是**机制**，不是厂商——quorum 不自带任何模型：
+    ``claude-cli`` / ``codex-cli`` 是两种内置起法，``exec`` 是通用的（自己写 argv，
+    接任何 CLI），``fake`` 是测试桩。底下跑谁的模型，由 ``env`` / ``argv`` / ``model``
+    决定，工具不解释也不验证。
+    """
     name: str
-    kind: str                      # claude-cli | codex-cli | fake
+    kind: str                      # claude-cli | codex-cli | exec | fake
     model: str = ""
+    harness: str = ""              # 覆盖 harness 名；留空则取 kind
     env: Dict[str, str] = field(default_factory=dict)
     # 形如 ANTHROPIC_AUTH_TOKEN_FILE 的键表示「值要从这个文件读」，密钥内容永不进配置
     argv: List[str] = field(default_factory=list)
+
+    @property
+    def harness_name(self) -> str:
+        return self.harness or self.kind
 
 
 @dataclass
@@ -150,6 +172,7 @@ def load(path: str) -> Config:
             name=name,
             kind=spec.get("kind", "claude-cli"),
             model=spec.get("model", ""),
+            harness=spec.get("harness", ""),
             env={str(k): str(v) for k, v in (spec.get("env") or {}).items()},
             argv=list(spec.get("argv") or []),
         )
@@ -159,18 +182,21 @@ def load(path: str) -> Config:
         ch = spec.get("channel", spec["name"])
         if ch not in channels:
             raise ConfigError("审核员 %s 引用了未定义的通道 %s" % (spec.get("name"), ch))
-        if not spec.get("family"):
+        # `family` 是 vendor 的旧名，保留为别名；新配置一律写 vendor。
+        vendor = spec.get("vendor") or spec.get("family")
+        if not vendor:
             raise ConfigError(
-                "审核员 %s 没有声明 family。family 是 COI 规则的**唯一依据**，"
-                "缺省值会让「同族不得有两个 primary」这条硬约束形同虚设"
-                "（三条 primary 全不写 family 就能全部通过）。" % spec["name"])
+                "审核员 %s 没有声明 vendor（模型来源）。vendor 是 COI 规则的**唯一依据**，"
+                "缺省值会让「同源不得有两个 primary」这条硬约束形同虚设"
+                "（三条 primary 全不写 vendor 就能全部通过）。" % spec["name"])
         role = spec.get("role", "primary")
         if role not in ("primary", "cross"):
             raise ConfigError("审核员 %s 的 role=%r 非法（只能是 primary 或 cross）——"
                               "写错大小写会让它静默生效为 cross 或 primary" % (spec["name"], role))
         reviewers.append(Reviewer(
             name=spec["name"], channel=ch,
-            family=spec["family"],
+            vendor=vendor,
+            harness=channels[ch].harness_name,     # 事实：从通道推出，不由审核员声明
             role=role,
             label=spec.get("label", ""),
             timeout_s=int(spec.get("timeout_s", 2700)),
@@ -197,13 +223,13 @@ def load(path: str) -> Config:
         path=path,
     )
 
-    # COI 自检：同 family 不得同时充当 primary（同源模型看不出同源盲区）
-    fams = {}
+    # COI 自检：同 vendor 不得同时充当 primary（同源模型看不出同源盲区）
+    by_vendor = {}
     for r in cfg.reviewers:
         if r.role == "primary":
-            fams.setdefault(r.family, []).append(r.name)
-    clashes = {f: n for f, n in fams.items() if len(n) > 1}
+            by_vendor.setdefault(r.vendor, []).append(r.name)
+    clashes = {v: n for v, n in by_vendor.items() if len(n) > 1}
     if clashes:
-        raise ConfigError("COI：同一 family 的模型不能同时当首选——%s。"
+        raise ConfigError("COI：同一 vendor（模型来源）不能同时当首选——%s。"
                           "把其中一个标成 role: cross" % clashes)
     return cfg

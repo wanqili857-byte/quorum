@@ -16,4 +16,4 @@ channels:
       CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144"    # 显式声明，否则客户端按默认窗口处理
 
 reviewers:
-  - {name: kimi, channel: ark, family: moonshot, role: primary}
+  - {name: kimi, channel: ark, vendor: moonshot, role: primary}

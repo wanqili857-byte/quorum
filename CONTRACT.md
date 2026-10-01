@@ -26,24 +26,54 @@ channels:
 以 `_FILE` 结尾的 env 键，其值按文件路径处理——密钥不进配置文件，也不进命令行参数
 （命令行会进 `ps` 和 shell 历史）。
 
-**`family` 是「声明」，不是「事实」** —— 工具无法验证两个审核员背后真的是两个不同厂商的模型：
-写 `family: a` / `family: b` 而通道指向同一个脚本，COI 校验照样通过。它能做的是把通道名记进结论头部，
-让人事后看得见「这三个『不同族』到底是不是同一个通道」。
+### 两条来源轴（新增，别把它们混成一个）
 
-**COI 规则是硬约束，不是建议**：同一 `family` 不能有两个 `role: primary`。
+交叉审计的价值来自**失效模式独立**。独立有两种，是**两件事**：
+
+| 轴 | 是什么 | 性质 | 不同意味着 |
+|---|---|---|---|
+| `vendor` | **模型来源**：谁训的权重 | **声明** | 训练数据/偏见的盲区不同 |
+| `harness` | **agent 框架**：哪个 CLI 在跑它 | **事实**（从 channel 推出） | 怎么读材料、怎么找证据、怎么下结论不同 |
+
+**只跨一个轴会骗到自己**：两个 vendor 走同一个 harness，共识可能来自那套 loop
+（同一 system prompt、同一工具、同一种套路），不是来自两个独立模型；同一个 vendor
+换 harness，换外壳不换模型，盲区还是共享的。所以 `plate` 两轴都报，同 harness 时**注记**
+（不降级——模型层的独立是真的）。见 §三。
+
+**`vendor` 是「声明」，不是「事实」** —— 工具无法验证两个审核员背后真的是两家不同厂商的模型：
+写 `vendor: a` / `vendor: b` 而通道指向同一个脚本，COI 校验照样通过。它能做的是把
+**两个轴都**记进结论头部，让人事后看得见「这三个『不同源』到底真不真」。
+
+**`harness` 反过来是事实**：由通道推出，审核员不能自己声明（`Reviewer.harness` 在
+`load()` 里由 `channel.harness_name` 填）。例外是通道上的 `harness:` 覆盖——`exec` 是通用起法，
+不覆盖的话两个完全不同的 CLI 都会被记成 `exec`，两个 harness 被塌成一个，**用 exec 时必须写**。
+反向禁止：**不要**用它给同一个 loop 换个名字来消掉注记，那只是把警告骗掉，独立性一点没多。
+
+**COI 规则是硬约束，不是建议**：同一 `vendor` 不能有两个 `role: primary`。
 违反时 `load()` 直接报错。理由：同源模型看不出同源的盲区，把它当成「两家独立验证」是自欺。
 同源模型可以当 `cross`（交叉参考），但它的结论**不计入**「跨模型族一致」——
-置信度只看 primary 审核员的 family 跨度。
+置信度只看 primary 审核员的两轴跨度。
 
 ```yaml
 reviewers:
-  - {name: kimi,  channel: ark,   family: moonshot, role: primary}
-  - {name: qwen,  channel: ark,   family: qwen,     role: primary}
-  - {name: codex, channel: codex, family: deepseek, role: cross}
+  - {name: a, channel: <端点A>, vendor: <模型来源A>, role: primary}
+  - {name: b, channel: <端点B>, vendor: <模型来源B>, role: primary}
+  - {name: c, channel: <别的CLI>, vendor: <模型来源C>, role: cross}
 ```
 
-**通道**：`kind` 决定怎么起进程。`claude-cli` 覆盖所有 Anthropic 兼容端点（换厂商只改配置）；
-`codex-cli` 用于本机 codex；`fake` 是桩，用于测试与 demo——**公开仓必须能无密钥跑通全流程**。
+**通道**：`kind` 决定怎么起进程，它描述的是**机制**，不是厂商——**quorum 不自带任何模型，
+也不自带任何 harness**。内置三种起法 + 一个桩：
+
+| `kind` | 起什么 | 只读能否强制 |
+|---|---|---|
+| `claude-cli` | 任何 Anthropic 兼容端点（换厂商只改 `env`） | 不能（靠工单措辞 + 事后快照比对） |
+| `codex-cli` | 本机 codex CLI | 能（`-s read-only`） |
+| `exec` | **任何别的 CLI**：自己写 `argv`，占位符 `{prompt}` / `{repo}` / `{out}` | 未知（由你的 argv 决定） |
+| `fake` | 桩，用于测试与 demo | n/a |
+
+`exec` 是 DIY 的入口：没有它，harness 维度就是**封闭枚举**——想接 aider / gemini-cli /
+自己写的脚本必须改库源码。**公开仓必须能无密钥跑通全流程**，所以 `fake` 永久保留。
+多厂商例子（含「不要骗注记」的反面说明）见 `examples/`；库代码里不出现任何厂商名。
 
 ---
 
@@ -102,13 +132,20 @@ quorum plate --config review.yaml --json
 ```
 
 ```json
-{"snapshots": {"kimi": "git:abc123"},
- "findings": [{"id": 1, "confidence": "跨模型族一致 · 高置信", "severity": "🔴",
-               "location": "report.md", "problem": "...",
-               "reviewers": ["kimi","qwen"], "families": ["moonshot","qwen"],
+{"snapshots": {"a": "git:abc123"},
+ "findings": [{"id": 1, "confidence": "跨模型族一致 · 高置信（注：primary 同走 claude-cli 这一个 harness，共识可能来自 harness 而非模型）",
+               "severity": "🔴", "location": "report.md", "problem": "...",
+               "reviewers": ["a","b"],
+               "vendors": ["moonshot","qwen"], "harnesses": ["claude-cli"],
+               "primary_vendors": ["moonshot","qwen"], "primary_harnesses": ["claude-cli"],
                "match_reason": "同文件 + 相似度 0.19",
-               "sources": [{"reviewer": "kimi", "evidence": "..."}]}]}
+               "disagreement": "各家措辞接近（平均相似度 0.44）",
+               "sources": [{"reviewer": "a", "evidence": "..."}]}]}
 ```
+
+`vendors` / `harnesses` 是**簇内全体**用到的轴；`primary_*` 只算 `role: primary`
+（`cross` 不计入置信度）。四个字段都在，是因为「两轴各跨了几个」是判断这次一致性
+值多少的**必要信息**——只给 `vendors` 会让人以为独立性只有一个维度。
 
 **对齐是启发式的，且刻意保守**：宁可把一条拆成两条（你去合并），也不要把两条不相干的合成一条
 （你去拆）。每条都带 `match_reason`。同一簇里各家的措辞与归因**可能不同甚至相反**，

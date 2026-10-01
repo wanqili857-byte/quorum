@@ -24,6 +24,15 @@ PATH_RE = re.compile(r"[\w./\-]+\.(?:py|md|json|jsonl|ya?ml|ipynb|sh|txt|toml|cf
 NOISE = set(" 　\t\n:：。，,、（）()「」【】*`>|/\\-_'\"…")
 
 
+def _uniq(seq) -> List[str]:
+    """保序去重（两轴都用它：vendor 与 harness 的取值集合）。"""
+    seen: List[str] = []
+    for x in seq:
+        if x not in seen:
+            seen.append(x)
+    return seen
+
+
 def _paths(text: str) -> set:
     out = set()
     for m in PATH_RE.findall(text or ""):
@@ -72,7 +81,8 @@ def _weighted_jaccard(a: set, b: set, weight) -> float:
 @dataclass
 class Row:
     reviewer: str
-    family: str
+    vendor: str            # 模型来源（声明）
+    harness: str           # agent 框架（事实，从通道推出）
     severity: str
     location: str
     problem: str
@@ -117,12 +127,12 @@ class Cluster:
         return [r.reviewer for r in self.rows]
 
     @property
-    def families(self) -> List[str]:
-        seen = []
-        for r in self.rows:
-            if r.family not in seen:
-                seen.append(r.family)
-        return seen
+    def vendors(self) -> List[str]:
+        return _uniq(r.vendor for r in self.rows)
+
+    @property
+    def harnesses(self) -> List[str]:
+        return _uniq(r.harness for r in self.rows)
 
     @property
     def severity(self) -> str:
@@ -130,26 +140,42 @@ class Cluster:
         return top.severity
 
     @property
-    def primary_families(self) -> List[str]:
+    def primary_vendors(self) -> List[str]:
         # CONTRACT：**cross 的结论不计入「跨模型族一致」**。
         # 旧版只看 len(families)，于是被标成 cross 的审核员照样把置信度抬高一档。
-        seen = []
-        for r in self.rows:
-            if r.role != "primary":
-                continue
-            if r.family not in seen:
-                seen.append(r.family)
-        return seen
+        return _uniq(r.vendor for r in self.rows if r.role == "primary")
+
+    @property
+    def primary_harnesses(self) -> List[str]:
+        """primary 审核员用到的 harness。**这是第二个独立轴**，不是 vendor 的别名。
+
+        两家 vendor 走同一个 harness 时，它们的共识可能来自 harness 本身
+        （同一套 system prompt、同一套工具、同一种「读文件—找证据—列表格」的套路），
+        而不是来自两个独立模型。见 `label()`。
+        """
+        return _uniq(r.harness for r in self.rows if r.role == "primary")
 
     def label(self) -> str:
         n_rev = len(self.reviewers)
-        n_pf = len(self.primary_families)
+        n_v = len(self.primary_vendors)
+        n_h = len(self.primary_harnesses)
         if n_rev == 1:
             return "单家独有 · 待复验"
-        if n_pf >= 2:
-            return "跨模型族一致 · 高置信"
-        if n_pf == 1:
-            return "含交叉 · 中置信（仅一族 primary）"
+        if n_v >= 2:
+            # 两个轴分开说：vendor 跨了几家、harness 是不是只有一种。
+            # 只有 vendor 那一维时，「跨模型族一致」是对的，但读者会顺手读成
+            # 「两个独立来源互相印证」——而它们在 harness 这一维上可能根本不独立。
+            # 所以这里**加注记而不降级**：模型层的独立是真的，抹掉是过度惩罚。
+            if n_h == 1:
+                return ("跨模型族一致 · 高置信（注：primary 同走 %s 这一个 harness，"
+                        "共识可能来自 harness 而非模型）" % self.primary_harnesses[0])
+            return "跨模型族一致 · 高置信（两轴皆跨：%d vendor × %d harness）" % (n_v, n_h)
+        if n_v == 1 and n_h >= 2:
+            # 反向的不独立：换 harness 不换模型，盲区还是共享的。
+            return ("同一 vendor · 仅 harness 不同（%s）——同权重同盲区，"
+                    "独立性只来自 harness" % "、".join(self.primary_harnesses))
+        if n_v == 1:
+            return "含交叉 · 中置信（仅一家 primary vendor）"
         return "仅交叉审核员 · 待复验"
 
     def headline(self) -> str:
@@ -175,7 +201,7 @@ def collect(cfg: Config) -> Tuple[List[Row], Dict[str, str]]:
         else:
             snaps[r.name] = "（该结论无快照标记）"
         for sev, loc, prob, ev in split_table_rows(text):
-            rows.append(Row(r.name, r.family, sev, loc, prob, ev, r.role))
+            rows.append(Row(r.name, r.vendor, r.harness, sev, loc, prob, ev, r.role))
     return rows, snaps
 
 
@@ -210,7 +236,8 @@ def cluster(rows: List[Row], thr_same_file: float = 0.07, thr_text: float = 0.10
             c = Cluster([row])
             c.members = [idx]
             clusters.append(c)
-    clusters.sort(key=lambda c: (-len(c.primary_families), -len(c.reviewers),
+    clusters.sort(key=lambda c: (-len(c.primary_vendors), -len(c.primary_harnesses),
+                                 -len(c.reviewers),
                                  -max(r.sev_rank for r in c.rows)))
     return clusters
 
@@ -226,6 +253,20 @@ def render(cfg: Config, clusters: List[Cluster], snaps: Dict[str, str]) -> str:
                    % json.dumps(snaps, ensure_ascii=False))
     elif snaps:
         out.append("> 材料快照一致：`%s`" % list(snaps.values())[0])
+
+    # 两个来源轴单独摆出来。这是交叉表的**元信息**，不是细节：
+    # 「vendor 跨了几家」和「harness 跨了几种」是两回事，而后者决定前者值多少。
+    out.append("> 来源轴：%s" % " · ".join(
+        "%s[%s @ %s / %s]" % (r.name, r.vendor, r.harness, r.role) for r in cfg.reviewers))
+    prim = [r for r in cfg.reviewers if r.role == "primary"]
+    if len(prim) >= 2:
+        if len({r.harness for r in prim}) == 1 and len({r.vendor for r in prim}) >= 2:
+            out.append("> ⚠️ primary 的 vendor 不同，但**全走同一个 harness**（`%s`）——"
+                       "它们的一致可能来自 harness（同一套 system prompt / 工具 / 套路），"
+                       "而非来自两个独立模型。" % prim[0].harness)
+        elif len({r.vendor for r in prim}) == 1 and len({r.harness for r in prim}) >= 2:
+            out.append("> ⚠️ primary 全是同一 vendor（`%s`）——换 harness 不换模型，"
+                       "盲区仍然共享，独立性只来自 harness。" % prim[0].vendor)
     out += ["", "## 汇总", "",
             "| # | 一致度 | 严重度 | 位置 | 一句话 | 哪几家 |", "|---|---|---|---|---|---|"]
     for i, c in enumerate(clusters, 1):
@@ -238,7 +279,8 @@ def render(cfg: Config, clusters: List[Cluster], snaps: Dict[str, str]) -> str:
         out.append("### %d. %s · %s · 位置 `%s`" % (i, c.severity, c.label(), c.rows[0].location[:60]))
         out.append("")
         for r in c.rows:
-            out.append("- **%s**（%s）：%s" % (r.reviewer, r.family, r.problem.strip()))
+            out.append("- **%s**（%s @ %s）：%s" % (r.reviewer, r.vendor, r.harness,
+                                                    r.problem.strip()))
             if r.evidence.strip():
                 out.append("  - 证据：%s" % r.evidence.strip()[:300])
         out.append("")
@@ -248,7 +290,11 @@ def render(cfg: Config, clusters: List[Cluster], snaps: Dict[str, str]) -> str:
         out.append("")
 
     out += ["## 读法", "",
-            "- **跨模型族一致** = 不同厂商的模型独立得出同一结论，最值得先看。",
+            "- **两个来源轴要分开读**：`vendor`（模型是谁训的，**声明**）与 `harness`"
+            "（哪个 agent CLI 在跑它，**事实**）。一致性只在**两轴都跨**时才等于「两个独立来源互相印证」。",
+            "- **跨模型族一致** = 不同 vendor 的模型独立得出同一结论，最值得先看；"
+            "但若它们同走一个 harness，共识可能来自 harness 本身——表头会注记。",
+            "- **同一 vendor · 仅 harness 不同** = 换了外壳没换模型，盲区还是共享的，独立性有限。",
             "- **单家独有** = 未必错，也未必对。真实案例里，被推翻的那条正是单家独有。",
             "- 同一簇里各家的**措辞与归因可能不同**（甚至相反）——所以明细逐条列原话，别只看汇总的一句话。",
             "- 「复验」由作者填：**审核员的结论是断言，不是事实**。",
@@ -268,10 +314,12 @@ def to_json(clusters: List[Cluster], snaps: Dict[str, str]) -> str:
             "location": c.rows[0].location,
             "problem": c.headline(),
             "reviewers": c.reviewers,
-            "families": c.families,
+            "vendors": c.vendors,
+            "harnesses": c.harnesses,
             "match_reason": c.why,
             "disagreement": c.disagreement,
-            "primary_families": c.primary_families,
+            "primary_vendors": c.primary_vendors,
+            "primary_harnesses": c.primary_harnesses,
             "sources": [{"reviewer": r.reviewer, "evidence": r.evidence} for r in c.rows],
         } for i, c in enumerate(clusters, 1)],
     }, ensure_ascii=False, indent=2)

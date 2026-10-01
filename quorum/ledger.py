@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -89,15 +90,33 @@ def parse(path: str) -> List[Entry]:
     return entries
 
 
+def _check_env() -> dict:
+    """跑 check 用的环境：把**运行 quorum 的这个解释器**所在目录放到 PATH 最前。
+
+    事故：`verify` 从头到尾没报错，却把 11 条 ✅ 判成「台账说谎」。真因不是台账说谎，
+    是 `bash -lc` 继承的 PATH 里没有 `pytest`（quorum 装在 venv 里，venv 没 activate）。
+    **同一个仓库、同一份台账，换台机器结论就变**——正是 docs/LESSONS.md 里
+    「门禁的结果不该取决于跑它的机器」那一条，只不过这次踩的是自己的 `verify`。
+
+    改法不是往 check 里写死路径（那只是把环境依赖挪个地方），而是让 check 在
+    「quorum 自己运行的那个环境」里跑——这个定义与调用方式无关，可预期。
+    """
+    env = dict(os.environ)
+    bindir = os.path.dirname(os.path.abspath(sys.executable))
+    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def run_checks(entries: List[Entry], cwd: str, timeout_s: int = 120) -> List[Verdict]:
     out: List[Verdict] = []
+    env = _check_env()
     for e in entries:
         if not e.check.strip():
             out.append(Verdict(e, False, None, ""))
             continue
         try:
             p = subprocess.run(["bash", "-lc", e.check], cwd=cwd, capture_output=True,
-                               text=True, timeout=timeout_s)
+                               text=True, timeout=timeout_s, env=env)
             out.append(Verdict(e, True, p.returncode, (p.stdout + p.stderr).strip()[-600:]))
         except subprocess.TimeoutExpired:
             out.append(Verdict(e, False, None, "超时 %ds" % timeout_s))

@@ -1,4 +1,20 @@
 # quorum 配置骨架。路径语义：配置里声明的相对路径按**本文件所在目录**解析。
+#
+# quorum **不自带任何模型，也不自带任何 harness**。下面每个值都是你的选择：
+#
+#   vendor  —— 模型来源（谁训的权重）。**声明**字段：工具验证不了真假，它只用来判断
+#              「这两个审核员是不是同源」——同源模型看不出同源的盲区。
+#              同一 vendor 不能有两个 primary。
+#   harness —— agent 框架（哪个 CLI 在跑它）。**事实**字段：从 channel 推出，不用你声明。
+#              两个轴都跨，一致性才等于「两个独立来源互相印证」。
+#
+# 接哪家模型、哪个 CLI 都行 —— 内置的起法只是**机制示例**，不是全部选项：
+#   kind: claude-cli   任何 Anthropic 兼容端点（换厂商只改 env，不动代码）
+#   kind: codex-cli    本机 codex CLI
+#   kind: exec         任何别的 CLI（自己写 argv）
+#
+# 真实的多厂商配置见 examples/ —— 那也只是例子，照抄要改成你自己的。
+
 project: my-project
 repo: .                       # 项目根（审核员的工作目录）
 brief: reviews/brief.md       # 工单：自包含，审核员没有前轮记忆
@@ -8,24 +24,41 @@ sources: ["src", "data", "reports"]   # 材料快照指纹覆盖这些路径
 snapshot_exclude: ["reviews/out", "node_modules", ".venv"]
 
 channels:
-  # 任何 Anthropic 兼容端点都能接：换厂商 = 改这里的 env，不动代码
-  ark:
+  # ① 任何 Anthropic 兼容端点
+  endpoint:
     kind: claude-cli
-    model: kimi-k2.7-code
+    model: <该端点支持的模型名>
     env:
-      ANTHROPIC_BASE_URL: https://ark.cn-beijing.volces.com/api/coding
-      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/ark_key   # 只给路径，内容不进配置/命令行
+      ANTHROPIC_BASE_URL: https://<你的端点>
+      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/<你的密钥文件>   # 只给路径，内容不进配置/命令行
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000"
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144"
+
+  # ② 本机 codex CLI
   codex:
     kind: codex-cli
 
+  # ③ 任何别的 CLI —— 「harness 可自定义」的入口就在这一条。
+  #    占位符 {prompt} 必给；{repo} 会换成审核员的工作目录；
+  #    argv 里出现 {out} 即表示该 CLI 自己写结论文件（quorum 就不重定向它的 stdout）。
+  #
+  #    ⚠️ 用 exec 时**必须**写 harness：exec 是通用起法，不写的话两个完全不同的
+  #       CLI 都会被记成 "exec"，两个 harness 被塌成一个。
+  #    ⚠️ 反过来，**不要**用它把同一个 loop 改名 —— 仅仅换个 BASE_URL 不构成
+  #       另一个 harness，那只是把 plate 的「同 harness」注记骗掉，独立性一点没多。
+  any-cli:
+    kind: exec
+    harness: my-agent            # 必填（用 exec 时）；别的 kind 可省略，默认取 kind
+    argv: ["my-agent", "--read-only", "-C", "{repo}", "-p", "{prompt}"]
+
 reviewers:
-  # family 决定 COI：同一 family 不能有两个 primary（同源模型看不出同源盲区）
-  - {name: kimi,  channel: ark,   family: moonshot, role: primary}
-  - {name: qwen,  channel: ark,   family: qwen,     role: primary}
-  - {name: codex, channel: codex, family: deepseek, role: cross}
+  # role: primary = 结论计入置信度；role: cross = 只作交叉参考，不计入。
+  # 同一 vendor 最多只能有一个 primary。
+  - {name: reviewer-a, channel: endpoint, vendor: <模型来源A>, role: primary}
+  - {name: reviewer-b, channel: any-cli,  vendor: <模型来源B>, role: primary}
+  - {name: reviewer-c, channel: codex,    vendor: <模型来源C>, role: cross}
 
 gates:
   min_bytes: 2000
-  min_severity_marks: 5
+  min_findings: 5               # 数的是**解析出来的发现条数**，不是 emoji 出现次数
   require_sections: ["最脆弱"]

@@ -12,10 +12,16 @@ channels:
     argv: ["python3", "channels/fake_reviewer.py"]
 
 reviewers:
-  # family 是 COI 规则的基础：同一 family 不能有两个 primary
-  - {name: alpha, channel: fake, family: vendor-a, role: primary, env: {FAKE_PERSONA: alpha}}
-  - {name: beta,  channel: fake, family: vendor-b, role: primary, env: {FAKE_PERSONA: beta}}
-  - {name: gamma, channel: fake, family: vendor-c, role: cross,   env: {FAKE_PERSONA: gamma}}
+  # 两个来源轴，**互相独立**：
+  #   vendor（模型来源）—— 声明，COI 规则建在它上面：同一 vendor 不能有两个 primary
+  #   harness（agent 框架）—— 事实，从 channel 推出，不由审核员声明
+  #
+  # demo 里三个人设**都走 fake 这一个通道** → harness 全是 `fake`。
+  # 这是**故意的**：它正好复现真实配置里那个毛病（两个 vendor 走同一个 harness），
+  # 于是 plate 会在表头给出注记——「共识可能来自 harness 而非模型」。看 demo 输出就能看到。
+  - {name: alpha, channel: fake, vendor: vendor-a, role: primary, env: {FAKE_PERSONA: alpha}}
+  - {name: beta,  channel: fake, vendor: vendor-b, role: primary, env: {FAKE_PERSONA: beta}}
+  - {name: gamma, channel: fake, vendor: vendor-c, role: cross,   env: {FAKE_PERSONA: gamma}}
 
 # 门禁阈值调小，因为 canned 结论是缩微版；真实项目用默认值（2000B / 5 条发现）
 # 注意：数的是**解析出来的发现条数**，不是 emoji 出现次数

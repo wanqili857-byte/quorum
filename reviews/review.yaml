@@ -27,9 +27,14 @@ channels:
     kind: codex-cli
 
 reviewers:
-  # family 决定 COI：同族不得有两个 primary
-  - {name: kimi,  channel: ark,       family: moonshot, role: primary, timeout_s: 2400}
-  - {name: qwen,  channel: dashscope, family: qwen,     role: primary, timeout_s: 2400, label: "第一轮就用过的审核员"}
-  - {name: codex, channel: codex,     family: deepseek, role: cross,   timeout_s: 2400}
+  # vendor 决定 COI：同一 vendor 不得有两个 primary（同源模型看不出同源盲区）
+  #
+  # ⚠️ 看这两个轴：kimi 与 qwen 的 **vendor 不同，但 harness 相同**（都走 claude-cli）。
+  # 它们的共识可能来自 Claude Code 这套 loop（同一 system prompt、同一工具、同一种套路），
+  # 而不只是来自两个独立模型。codex 才是另一个 harness。
+  # 旧版只记 vendor，plate 会打出「跨模型族一致 · 高置信」，读者容易以为买到了两维独立。
+  - {name: kimi,  channel: ark,       vendor: moonshot, role: primary, timeout_s: 2400}
+  - {name: qwen,  channel: dashscope, vendor: qwen,     role: primary, timeout_s: 2400, label: "第一轮就用过的审核员"}
+  - {name: codex, channel: codex,     vendor: deepseek, role: cross,   timeout_s: 2400}
 
-gates: {min_bytes: 2000, min_severity_marks: 5, require_sections: ["最脆弱"]}
+gates: {min_bytes: 2000, min_findings: 5, require_sections: ["最脆弱"]}

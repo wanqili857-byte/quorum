@@ -1,0 +1,67 @@
+# 例：三个审核员，两个来源轴都报出来。
+#
+#   ⚠️ 这是**例子**，不是全部选项。quorum 不自带任何模型，也不自带任何 harness——
+#      换成你自己的 vendor / 端点 / CLI 即可。库代码里没有任何厂商名。
+#
+# 两个轴是**两件事**：
+#
+#   vendor  —— 模型来源（谁训的权重）。**声明**，工具验证不了。
+#   harness —— agent 框架（哪个 CLI 在跑它）。**事实**，从 channel 推出。
+#
+# 本文件刻意用**最常见的那种配置**（你大概只有两个 harness，却有三个模型来源）：
+
+project: example-multi-vendor
+repo: ..
+brief: reviews/brief.md
+out_dir: reviews/out
+
+channels:
+  # 两个 Anthropic 兼容端点，都用 claude-cli 起进程 → 同一个 harness
+  ark:
+    kind: claude-cli
+    model: <该端点支持的模型名>
+    env:
+      ANTHROPIC_BASE_URL: https://ark.cn-beijing.volces.com/api/coding
+      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/ark_key
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000"
+  dashscope:
+    kind: claude-cli
+    model: <该端点支持的模型名>
+    env:
+      ANTHROPIC_BASE_URL: https://dashscope.aliyuncs.com/apps/anthropic
+      ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/dashscope_key
+
+  # 完全不同的 agent 框架
+  codex:
+    kind: codex-cli
+
+reviewers:
+  - {name: kimi,  channel: ark,       vendor: moonshot, role: primary}
+  - {name: qwen,  channel: dashscope, vendor: qwen,     role: primary}
+  - {name: codex, channel: codex,     vendor: deepseek, role: cross}
+
+gates: {min_bytes: 2000, min_findings: 5, require_sections: ["最脆弱"]}
+
+# ---------------------------------------------------------------------------
+# 跑起来 plate 会这样注记：
+#
+#   > ⚠️ primary 的 vendor 不同，但**全走同一个 harness**（`claude-cli`）——
+#   >   它们的一致可能来自 harness（同一套 system prompt / 工具 / 套路），
+#   >   而非来自两个独立模型。
+#
+# 这正是实话：kimi 和 qwen 是两个 vendor，但都被 Claude Code 这套 loop 跑。
+# **不要**为了把这条注记去掉而给 dashscope 加一句 `harness: dashscope-cli` ——
+# 仅仅换个 BASE_URL 不构成另一个 harness，那只是把警告骗掉，独立性一点没多。
+#
+# 真想跨开第二个轴，得换掉**跑它的那套 loop**，比如用 exec 接另一个 agent CLI：
+#
+#   channels:
+#     any-cli:
+#       kind: exec
+#       harness: gemini-cli                     # exec 是通用起法，harness 必须自己起名，
+#       argv: ["gemini", "-p", "{prompt}"]      # 否则两个不同的 CLI 都会被记成 "exec"
+#   reviewers:
+#     - {name: qwen, channel: any-cli, vendor: qwen, role: primary}
+#
+# 没有第三个 harness 就**如实承认那一个轴没跨**。这不是缺陷，是信息：
+# 它告诉你这次「三家一致」里，有多少是 harness 的功劳。

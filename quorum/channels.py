@@ -89,6 +89,19 @@ def build(channel: Channel, reviewer: Reviewer, cfg: Config, prompt: str) -> Tup
         argv += ["-o", "__OUT__", prompt]          # __OUT__ 由 runner 替换成临时文件
         return argv, env, True
 
+    if kind == "exec":
+        # 通用通道：**任何** CLI，自己写 argv。占位符 `{prompt}` / `{repo}` / `{out}`。
+        #
+        # 这个分支存在的理由：只有 claude-cli / codex-cli 两种内置起法的话，
+        # harness 维度就是**封闭枚举**——想接 aider / gemini-cli / 自己写的脚本，
+        # 必须改本文件的源码。那样「harness 可自定义」就是一句空话。
+        if not channel.argv:
+            raise ChannelError("exec 通道需要 argv（占位符：{prompt} / {repo} / {out}）")
+        writes_to_file = any("{out}" in a for a in channel.argv)
+        argv = [a.replace("{repo}", cfg.repo).replace("{prompt}", prompt)
+                for a in channel.argv]
+        return argv, env, writes_to_file
+
     if kind == "fake":
         # 桩通道：argv[0] 是一个脚本，读 FAKE_FINDINGS 指定的文件并打印。
         # 公开仓靠它做 e2e 测试与 demo —— 没有密钥也能跑完整流程。
@@ -96,7 +109,8 @@ def build(channel: Channel, reviewer: Reviewer, cfg: Config, prompt: str) -> Tup
             raise ChannelError("fake 通道需要 argv 指向一个脚本")
         return list(channel.argv) + [prompt], env, False
 
-    raise ChannelError("未知通道类型：%s（可选 claude-cli | codex-cli | fake）" % kind)
+    raise ChannelError("未知通道类型：%s（可选 claude-cli | codex-cli | exec | fake）"
+                       "——想接别的 CLI 用 exec，不需要改源码" % kind)
 
 
 READONLY = {
@@ -104,6 +118,7 @@ READONLY = {
     # 这一点必须显式说出来，不能让大家以为「审核员只读」是都被保证了的。
     "codex-cli": "enforced（-s read-only）",
     "claude-cli": "NOT enforced（CLI 无沙箱开关；靠工单措辞 + 事后快照比对）",
+    "exec": "未知（由你的 argv 决定；quorum 不保证）",
     "fake": "n/a",
 }
 
@@ -116,7 +131,7 @@ def describe(cfg: Config) -> str:
     """给日志用的一行摘要。"""
     parts = []
     for r in cfg.reviewers:
-        parts.append("%s[%s/%s]" % (r.name, r.family, r.role))
+        parts.append("%s[%s@%s/%s]" % (r.name, r.vendor, r.harness, r.role))
     return " · ".join(parts)
 
 
