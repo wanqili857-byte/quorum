@@ -60,8 +60,12 @@ def default_patterns(username: str = "") -> List[Pattern]:
         # 而 `~/.config/ark_key` 这种写法在配置示例里到处都是（曾经把它误报成泄漏）。
         Pattern("波浪线家目录", r"~/(?!\.|proj/|tmp/)[A-Za-z0-9_\-]+/",
                 "~/realname/work/x.md", "`~/<用户名>/` 形态——脱敏最常漏的一类"),
-        Pattern("本机用户名", r"(?<![\w/])%s(?![\w])" % re.escape(u),
-                "由 %s 自己构成的串" % u, "当前机器的用户名出现在材料里"),
+        # 必须**锚在路径里**：`[/~]name/`。
+        # 旧版是裸词匹配 `(?<![\w/])name(?![\w])` —— 于是 CI 上（用户名恰好是 `runner`）
+        # 它把英文单词 "runner" 全报成泄漏。**门禁的结果取决于跑它的机器**，这是比误报更糟的事。
+        # 而要防的泄漏本来就是「路径里出现本机用户名」，锚在路径上既更准也更稳。
+        Pattern("路径里的本机用户名", r"[/~]%s/" % re.escape(u),
+                "/home/%s/project/file" % u, "本机用户名出现在路径里"),
         Pattern("凭证形态", r"(sk-[A-Za-z0-9_\-]{8,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}"
                         r"|Bearer\s+[A-Za-z0-9._\-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)",
                 "sk-abcdefghijklmnop", "API key / token / 私钥"),
