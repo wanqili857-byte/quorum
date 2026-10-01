@@ -58,7 +58,7 @@ class Channel:
 @dataclass
 class Gates:
     min_bytes: int = 2000
-    min_severity_marks: int = 5
+    min_findings: int = 5
     require_sections: List[str] = field(default_factory=lambda: ["最脆弱"])
 
 
@@ -79,12 +79,31 @@ class Config:
 
     # ---- 便捷视图 -------------------------------------------------------
     @property
+    def _base(self) -> str:
+        """配置里声明的相对路径的相对基准 = **配置文件所在目录**（契约如此，实现也必须如此）。"""
+        return os.path.dirname(self.path) if self.path else self.repo
+
+    def _resolve(self, p: str) -> str:
+        return p if os.path.isabs(p) else os.path.normpath(os.path.join(self._base, p))
+
+    @property
     def brief_abs(self) -> str:
-        return os.path.join(self.repo, self.brief) if not os.path.isabs(self.brief) else self.brief
+        return self._resolve(self.brief)
 
     @property
     def out_dir_abs(self) -> str:
-        return os.path.join(self.repo, self.out_dir) if not os.path.isabs(self.out_dir) else self.out_dir
+        return self._resolve(self.out_dir)
+
+    def brief_for_prompt(self) -> str:
+        """给审核员看的工单路径：在 repo 内就给相对路径（它的 cwd 是 repo），否则给绝对路径。
+
+        不传对路径的后果很隐蔽：审核员会**自己去找**，找得到就照常产出——看起来一切正常，
+        但那是运气不是设计。"""
+        try:
+            rel = os.path.relpath(self.brief_abs, self.repo)
+        except ValueError:
+            return self.brief_abs
+        return self.brief_abs if rel.startswith("..") else rel
 
     def out_path(self, reviewer: str) -> str:
         return os.path.join(self.out_dir_abs, "%s-findings-%s.md" % (self.project, reviewer))
@@ -140,9 +159,14 @@ def load(path: str) -> Config:
         ch = spec.get("channel", spec["name"])
         if ch not in channels:
             raise ConfigError("审核员 %s 引用了未定义的通道 %s" % (spec.get("name"), ch))
+        if not spec.get("family"):
+            raise ConfigError(
+                "审核员 %s 没有声明 family。family 是 COI 规则的**唯一依据**，"
+                "缺省值会让「同族不得有两个 primary」这条硬约束形同虚设"
+                "（三条 primary 全不写 family 就能全部通过）。" % spec["name"])
         reviewers.append(Reviewer(
             name=spec["name"], channel=ch,
-            family=spec.get("family", "unknown"),
+            family=spec["family"],
             role=spec.get("role", "primary"),
             label=spec.get("label", ""),
             timeout_s=int(spec.get("timeout_s", 2700)),
@@ -154,7 +178,8 @@ def load(path: str) -> Config:
     g = raw.get("gates") or {}
     gates = Gates(
         min_bytes=int(g.get("min_bytes", 2000)),
-        min_severity_marks=int(g.get("min_severity_marks", 5)),
+        # 旧键 min_severity_marks 仍接受，但语义已改为「发现条数」——名字必须跟着语义走
+        min_findings=int(g.get("min_findings", g.get("min_severity_marks", 5))),
         require_sections=list(g.get("require_sections") or ["最脆弱"]),
     )
 
@@ -173,7 +198,7 @@ def load(path: str) -> Config:
     for r in cfg.reviewers:
         if r.role == "primary":
             fams.setdefault(r.family, []).append(r.name)
-    clashes = {f: n for f, n in fams.items() if len(n) > 1 and f != "unknown"}
+    clashes = {f: n for f, n in fams.items() if len(n) > 1}
     if clashes:
         raise ConfigError("COI：同一 family 的模型不能同时当首选——%s。"
                           "把其中一个标成 role: cross" % clashes)

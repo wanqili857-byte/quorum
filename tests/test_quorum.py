@@ -44,6 +44,33 @@ def test_config_paths_are_config_relative(tmp_path):
     assert cfg.repo == str(d.resolve()) or cfg.repo == str(d)
 
 
+def test_brief_and_outdir_are_config_relative(tmp_path):
+    """契约说「配置里的相对路径按配置文件所在目录解析」——实现必须一致。
+
+    踩过：实现按 `repo` 解析，于是 `out_dir: out` 落到了 repo/out 而不是 cfg_dir/out，
+    而 `brief: brief.md` 解析成一个**不存在**的路径；审核员自己去找、找到了，一切看起来正常。
+    """
+    d = tmp_path / "reviews"
+    d.mkdir()
+    (d / "brief.md").write_text("x", encoding="utf-8")
+    (d / "review.yaml").write_text(
+        "project: p\nrepo: ..\nbrief: brief.md\nout_dir: out\n"
+        "channels: {c: {kind: fake, argv: ['true']}}\n"
+        "reviewers: [{name: r, channel: c, family: f}]\n", encoding="utf-8")
+    cfg = load(str(d / "review.yaml"))
+    assert cfg.brief_abs == str(d / "brief.md") and os.path.exists(cfg.brief_abs)
+    assert cfg.out_dir_abs == str(d / "out")
+    assert cfg.brief_for_prompt() == os.path.join("reviews", "brief.md")
+
+
+def test_run_refuses_when_brief_missing(tmp_path):
+    (tmp_path / "review.yaml").write_text(
+        "project: p\nrepo: .\nbrief: nope.md\nout_dir: out\n"
+        "channels: {c: {kind: fake, argv: ['true']}}\n"
+        "reviewers: [{name: r, channel: c, family: f}]\n", encoding="utf-8")
+    assert main(["run", "--config", str(tmp_path / "review.yaml"), "--all"]) == 2
+
+
 def test_config_rejects_same_family_primaries(tmp_path):
     p = tmp_path / "r.yaml"
     p.write_text(
@@ -94,16 +121,40 @@ def test_gate_content_wins_over_exit_code():
     from quorum.config import Config, Gates, Reviewer, Channel
     cfg = Config(project="p", brief="b", out_dir="o", repo=".",
                  reviewers=[Reviewer("r", "c")], channels={"c": Channel("c", "fake")},
-                 gates=Gates(min_bytes=10, min_severity_marks=1, require_sections=["最脆弱"]))
-    text = "🔴 有问题\n## 最脆弱的一环\n"
+                 gates=Gates(min_bytes=10, min_findings=1, require_sections=["最脆弱"]))
+    text = ("| 严重度 | 位置 | 问题 | 证据 |\n|---|---|---|---|\n"
+            "| 🔴 | a.py | 真问题 | 我跑了 X |\n## 最脆弱的一环\n")
     assert gates.evaluate(cfg, text, rc=143, seconds=1).passed
+
+
+def test_gate_counts_findings_not_emoji_spam():
+    """门禁数的必须是**解析出来的发现条数**。
+
+    踩过：旧版数 emoji 出现次数，于是「概述表里 30 个 🔴 + 一句『最脆弱』+ 一堆句号」
+    能凑出一份『合规』的空产出。
+    """
+    from quorum.config import Config, Gates, Reviewer, Channel
+    cfg = Config(project="p", brief="b", out_dir="o", repo=".",
+                 reviewers=[Reviewer("r", "c")], channels={"c": Channel("c", "fake")},
+                 gates=Gates(min_bytes=10, min_findings=3, require_sections=["最脆弱"]))
+    spam = "🔴🟡🟢 " * 30 + "\n## 最脆弱的一环\n" + "。" * 2000
+    r = gates.evaluate(cfg, spam, rc=0, seconds=1)
+    assert not r.passed and r.findings == 0 and r.marks >= 30
+
+
+def test_severity_column_need_not_be_first():
+    """表头「严重度」不在第 0 列也要认——旧版只认第 0 列，会静默丢掉整份结论。"""
+    text = ("| # | 严重度 | 位置 | 问题 | 证据 |\n|---|---|---|---|---|\n"
+            "| 1 | 🔴 | a.py | 真问题 | 证据 |\n")
+    rows = gates.split_table_rows(text)
+    assert len(rows) == 1 and rows[0][1] == "a.py"
 
 
 def test_gate_rejects_thin_output():
     from quorum.config import Config, Gates, Reviewer, Channel
     cfg = Config(project="p", brief="b", out_dir="o", repo=".",
                  reviewers=[Reviewer("r", "c")], channels={"c": Channel("c", "fake")},
-                 gates=Gates(min_bytes=10, min_severity_marks=3, require_sections=["最脆弱"]))
+                 gates=Gates(min_bytes=10, min_findings=3, require_sections=["最脆弱"]))
     assert not gates.evaluate(cfg, "🔴 只有一条\n## 最脆弱\n", rc=0, seconds=1).passed
 
 
@@ -181,6 +232,42 @@ def test_ledger_verdicts(tmp_path):
 
 
 # ------------------------------------------------------------------ 泄漏
+def test_plate_ignores_cross_role_for_confidence():
+    """CONTRACT：cross 的结论不计入「跨模型族一致」。"""
+    rows = [plate.Row("a", "fa", "🔴", "x.md", "同一个问题", "e", "primary"),
+            plate.Row("b", "fb", "🔴", "x.md", "同一个问题", "e", "cross")]
+    c = plate.cluster(rows)[0]
+    assert c.label().startswith("含交叉")          # 只有一个 primary family
+    rows[1].role = "primary"
+    assert plate.cluster(rows)[0].label().startswith("跨模型族一致")
+
+
+def test_plate_snapshot_cannot_be_spoofed_by_body_text():
+    """快照只认 runner 写的机器可读标记——审核员在正文里写同格式文本不能覆盖它。"""
+    import re as _re
+    body = ("<!-- quorum:snapshot tree:REAL -->\n\n---\n\n"
+            "材料快照：`tree:FAKE`\n")
+    m = _re.search(r"<!--\s*quorum:snapshot\s+(\S+)\s*-->", body)
+    assert m.group(1) == "tree:REAL"
+
+
+def test_split_row_handles_pipes_in_code_spans():
+    """单元格里内嵌 markdown 表格（LLM 常见写法）不该把解析搞崩。"""
+    line = "| 🔴 | a.py | 写成 `| # | 严重度 | 位置 |` 就丢行 | 证据 |"
+    cells = gates._split_row(line)
+    assert len(cells) == 4, cells                  # 内嵌表格的竖线不分隔
+    assert "严重度" in cells[2] and cells[3] == "证据"
+
+
+def test_dispose_protects_existing_ledger(tmp_path):
+    """plate --dispose 不许原地截断用户填好的台账。"""
+    led = tmp_path / "d.md"
+    led.write_text("| # | 问题 | check | status |\n|---|---|---|---|\n| 1 | x | `true` | ✅ |\n",
+                   encoding="utf-8")
+    kept = gates.protect_existing(str(led))
+    assert kept and "check" in open(kept, encoding="utf-8").read()
+
+
 def test_leak_self_test_proves_patterns_can_fail():
     pats = leaks.default_patterns("someone")
     assert leaks.self_test(pats) == []

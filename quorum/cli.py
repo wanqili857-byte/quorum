@@ -36,8 +36,15 @@ def cmd_run(a) -> int:
     for n in want:
         cfg.reviewer(n)                            # 提前校验名字
 
+    # 工单必须先存在：不存在的工单照样能跑起来（审核员会自己去找，找得到就照常产出），
+    # 于是你会拿到一份「看起来正常、其实没按工单审」的结论——这是最贵的一类静默失败。
+    if not os.path.exists(cfg.brief_abs):
+        print("工单不存在：%s（配置里的 brief=%s）" % (cfg.brief_abs, cfg.brief), file=sys.stderr)
+        return 2
+
     snap = snapshot.take(cfg)
     print("项目 %s · 审核员 %s" % (cfg.project, ", ".join(want)))
+    print("工单：%s" % cfg.brief_for_prompt())
     print(snap.header_line().lstrip("> "))
     if a.dry_run:
         for n in want:
@@ -66,7 +73,10 @@ def cmd_run(a) -> int:
         else:
             stdout_path = tmp_out
 
-        print("\n── %s（通道 %s · 上限 %ds）" % (n, r.channel, r.timeout_s))
+        ro = channels.readonly_note(cfg.channels[r.channel])
+        print("\n── %s（通道 %s · 上限 %ds · 只读: %s）" % (n, r.channel, r.timeout_s, ro))
+        if "NOT enforced" in ro:
+            print("   ⚠ 该通道无法在 CLI 层强制只读——只读靠工单措辞，事后由材料快照比对兜底")
         t0 = datetime.now()
         rc = gates.run_with_timeout(argv, env, r.timeout_s, stdout_path, raw, cwd=cfg.repo)
         secs = int((datetime.now() - t0).total_seconds())
@@ -85,6 +95,8 @@ def cmd_run(a) -> int:
                         snap.digest, snap_after.digest)
 
         if result.passed:
+            if "NOT enforced" in ro:
+                extra = (extra + " " if extra else "") + "只读强度：未强制（%s）" % ro
             body = gates.header(cfg, n, snap.header_line(), extra) + text
             gates.atomic_write(out, body)
             print("  %s 通过（%s）→ %s" % (OK, result.summary(), os.path.relpath(out, cfg.repo)))
@@ -114,8 +126,13 @@ def cmd_plate(a) -> int:
     if a.dispose:
         path = a.dispose if isinstance(a.dispose, str) else os.path.join(cfg.out_dir_abs, "%s-dispose.md" % cfg.project)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, "w", encoding="utf-8").write(plate.dispose_skeleton(cfg, clusters))
-        print("\n处置台账骨架 → %s" % path)
+        # 这里曾经是裸 `open(path,"w")` —— 与 docs/LESSONS.md 事故二**同一个写法**，
+        # 而且默认路径正好就是用户填好的台账本身：一份填了 check/status 的台账会被整份擦成空骨架。
+        kept = gates.protect_existing(path)
+        if kept:
+            print("\n已有台账非空 → 先留档为 %s" % os.path.basename(kept))
+        gates.atomic_write(path, plate.dispose_skeleton(cfg, clusters))
+        print("处置台账骨架 → %s" % path)
     if a.json and a.dispose:
         pass
     return 0
@@ -152,7 +169,11 @@ def cmd_leaks(a) -> int:
             pass
 
     if a.self_test:
-        bad = [f for f in leaks.self_test(pats) if "样本" not in f]     # 配置规则可自供样本
+        # 这里曾经写成 `[f for f in self_test(pats) if "样本" not in f]`，
+        # 而失败消息正是「正则抓不到自己种的样本」——**过滤条件恰好滤掉了它要抓的东西**，
+        # 于是「检查能不能失败」的检查自己永远不能失败。配置带来的规则若没给样本，
+        # 在 self_test 里跳过即可，不该在这一层做字符串过滤。
+        bad = leaks.self_test(pats)
         _hdr("自检：这些规则能不能抓到自己种的样本")
         if bad:
             for b in bad:

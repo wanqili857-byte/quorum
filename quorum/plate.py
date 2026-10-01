@@ -77,6 +77,7 @@ class Row:
     location: str
     problem: str
     evidence: str
+    role: str = "primary"
 
     @property
     def sev_rank(self) -> int:
@@ -88,6 +89,25 @@ class Cluster:
     rows: List[Row] = field(default_factory=list)
     why: str = ""
     members: List[int] = field(default_factory=list)
+
+    @property
+    def disagreement(self) -> str:
+        """同簇各家措辞/归因的**分歧程度**。
+
+        合并只说明「说的是同一处」，不说明「结论相同」——而汇总表只印一句话，
+        读者很容易把一簇当成一个结论。真实案例：一簇里三家里有一家**归因是错的**。
+        这里给出一个粗粒度信号，让读者知道该不该逐条细读。
+        """
+        if len(self.rows) < 2:
+            return ""
+        toks = [_tokens(r.location + " " + r.problem) for r in self.rows]
+        weight = _idf_weighter(toks)
+        sims = [_weighted_jaccard(toks[i], toks[j], weight)
+                for i in range(len(toks)) for j in range(i + 1, len(toks))]
+        avg = sum(sims) / len(sims) if sims else 0.0
+        if avg < 0.20:
+            return "⚠️ 各家归因可能不同（平均相似度 %.2f）——**逐条读原话**" % avg
+        return "各家措辞接近（平均相似度 %.2f）" % avg
 
     @property
     def reviewers(self) -> List[str]:
@@ -106,14 +126,28 @@ class Cluster:
         top = max(self.rows, key=lambda r: r.sev_rank)
         return top.severity
 
+    @property
+    def primary_families(self) -> List[str]:
+        # CONTRACT：**cross 的结论不计入「跨模型族一致」**。
+        # 旧版只看 len(families)，于是被标成 cross 的审核员照样把置信度抬高一档。
+        seen = []
+        for r in self.rows:
+            if r.role != "primary":
+                continue
+            if r.family not in seen:
+                seen.append(r.family)
+        return seen
+
     def label(self) -> str:
-        n_fam = len(self.families)
         n_rev = len(self.reviewers)
+        n_pf = len(self.primary_families)
         if n_rev == 1:
             return "单家独有 · 待复验"
-        if n_fam >= 2:
+        if n_pf >= 2:
             return "跨模型族一致 · 高置信"
-        return "同族多家一致 · 中置信"
+        if n_pf == 1:
+            return "含交叉 · 中置信（仅一族 primary）"
+        return "仅交叉审核员 · 待复验"
 
     def headline(self) -> str:
         return self.rows[0].problem
@@ -127,10 +161,18 @@ def collect(cfg: Config) -> Tuple[List[Row], Dict[str, str]]:
         text = read_text(p)
         if not text:
             continue
-        for m in re.finditer(r"材料快照：`([^`]+)`", text):
+        # 只认 runner 写在头部的**机器可读标记**。旧版用 `材料快照：\`([^\`]+)\`` 全篇扫描、
+        # 后者覆盖前者 —— 审核员只要在正文里写一行同格式文本，就能把真快照盖掉、
+        # 从而**关掉 plate 的快照不一致告警**。
+        m = re.search(r"<!--\s*quorum:snapshot\s+(\S+)\s*-->", text)
+        if not m:
+            m = re.search(r"材料快照：`([^`]+)`", text.split("\n---\n")[0])
+        if m:
             snaps[r.name] = m.group(1)
+        else:
+            snaps[r.name] = "（该结论无快照标记）"
         for sev, loc, prob, ev in split_table_rows(text):
-            rows.append(Row(r.name, r.family, sev, loc, prob, ev))
+            rows.append(Row(r.name, r.family, sev, loc, prob, ev, r.role))
     return rows, snaps
 
 
@@ -164,7 +206,8 @@ def cluster(rows: List[Row], thr_same_file: float = 0.07, thr_text: float = 0.10
             c = Cluster([row])
             c.members = [idx]
             clusters.append(c)
-    clusters.sort(key=lambda c: (-len(c.families), -len(c.reviewers), -max(r.sev_rank for r in c.rows)))
+    clusters.sort(key=lambda c: (-len(c.primary_families), -len(c.reviewers),
+                                 -max(r.sev_rank for r in c.rows)))
     return clusters
 
 
@@ -195,6 +238,8 @@ def render(cfg: Config, clusters: List[Cluster], snaps: Dict[str, str]) -> str:
             if r.evidence.strip():
                 out.append("  - 证据：%s" % r.evidence.strip()[:300])
         out.append("")
+        if c.disagreement:
+            out.append("  - %s" % c.disagreement)
         out.append("  - 复验：⬜（填 `confirmed` / `refuted` / `partial` + 一句证据）")
         out.append("")
 

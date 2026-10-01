@@ -40,7 +40,7 @@ DEFAULT_PROMPT = """你是独立外部审计员，与本项目无关。工作目
 
 
 def build_prompt(cfg: Config, reviewer: Reviewer) -> str:
-    return DEFAULT_PROMPT.format(repo=cfg.repo, brief=cfg.brief)
+    return DEFAULT_PROMPT.format(repo=cfg.repo, brief=cfg.brief_for_prompt())
 
 
 def _resolve_env(env: Dict[str, str]) -> Dict[str, str]:
@@ -97,6 +97,19 @@ def build(channel: Channel, reviewer: Reviewer, cfg: Config, prompt: str) -> Tup
         return list(channel.argv) + [prompt], env, False
 
     raise ChannelError("未知通道类型：%s（可选 claude-cli | codex-cli | fake）" % kind)
+
+
+READONLY = {
+    # 通道层能不能**强制**只读。不能强制的，只能靠工单措辞 + 事后材料快照比对，
+    # 这一点必须显式说出来，不能让大家以为「审核员只读」是都被保证了的。
+    "codex-cli": "enforced（-s read-only）",
+    "claude-cli": "NOT enforced（CLI 无沙箱开关；靠工单措辞 + 事后快照比对）",
+    "fake": "n/a",
+}
+
+
+def readonly_note(channel: Channel) -> str:
+    return READONLY.get(channel.kind, "未知通道")
 
 
 def describe(cfg: Config) -> str:

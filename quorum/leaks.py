@@ -14,11 +14,30 @@ from __future__ import annotations
 import getpass
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
-TEXT_EXT = (".py", ".md", ".json", ".jsonl", ".yaml", ".yml", ".ipynb", ".sh",
-            ".txt", ".toml", ".cfg", ".ini", ".html", ".js", ".ts")
+# 不再用扩展名白名单：**漏掉的恰恰是最危险的**（`.env` / `.log` / `.pem` / 无扩展名）。
+# 改为「读得动就读」——按内容嗅探二进制，读不动就跳过。
+MAX_FILE_BYTES = 4 * 1024 * 1024
+
+
+def _is_text(p: str) -> bool:
+    try:
+        if os.path.getsize(p) > MAX_FILE_BYTES:
+            return False
+        with open(p, "rb") as f:
+            chunk = f.read(4096)
+    except OSError:
+        return False
+    if b"\x00" in chunk:
+        return False
+    try:
+        chunk.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache",
              "dist", "build", ".pytest_cache"}
@@ -63,6 +82,23 @@ def _compile(patterns: List[Pattern]) -> List[Tuple[Pattern, "re.Pattern"]]:
 FIXTURE_FILE = os.path.abspath(__file__)
 
 
+def tracked_files(root: str) -> List[str]:
+    """git 仓库 → 返回**被跟踪**的文件；否则返回 []（调用方回落到 os.walk）。
+
+    为什么只扫被跟踪的：这个门禁的职责是「**会被发布出去的东西**里有没有泄漏」。
+    结论目录、构建产物、虚拟环境都是 gitignore 的，扫描它们只会制造假警报，
+    而假警报会让真警报被忽略——那比不扫更糟。
+    """
+    try:
+        out = subprocess.run(["git", "-C", root, "ls-files"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [os.path.join(root, l) for l in out.stdout.splitlines() if l.strip()]
+
+
 def scan(root: str, patterns: List[Pattern], max_hits: int = 5,
          skip_files: Tuple[str, ...] = ()) -> Dict[str, List[Tuple[str, int, str]]]:
     """返回 {规则名: [(相对路径, 行号, 命中片段), ...]}
@@ -71,25 +107,32 @@ def scan(root: str, patterns: List[Pattern], max_hits: int = 5,
     """
     compiled = _compile(patterns)
     hits: Dict[str, List[Tuple[str, int, str]]] = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for fn in filenames:
-            if not fn.endswith(TEXT_EXT):
-                continue
-            p = os.path.join(dirpath, fn)
-            if os.path.abspath(p) in skip_files:
-                continue
-            rel = os.path.relpath(p, root)
-            try:
-                for i, line in enumerate(open(p, encoding="utf-8", errors="ignore"), 1):
-                    for pat, rx in compiled:
-                        m = rx.search(line)
-                        if m:
-                            hits.setdefault(pat.name, [])
-                            if len(hits[pat.name]) < max_hits:
-                                hits[pat.name].append((rel, i, m.group(0)[:60]))
-            except OSError:
-                continue
+    files = tracked_files(root)
+    if files:
+        candidates = [(f, os.path.relpath(f, root)) for f in files]
+    else:
+        candidates = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for fn in filenames:
+                p = os.path.join(dirpath, fn)
+                if _is_text(p):
+                    candidates.append((p, os.path.relpath(p, root)))
+    for p, rel in candidates:
+        if os.path.abspath(p) in skip_files or not os.path.exists(p):
+            continue
+        if not _is_text(p):
+            continue
+        try:
+            for i, line in enumerate(open(p, encoding="utf-8", errors="ignore"), 1):
+                for pat, rx in compiled:
+                    m = rx.search(line)
+                    if m:
+                        hits.setdefault(pat.name, [])
+                        if len(hits[pat.name]) < max_hits:
+                            hits[pat.name].append((rel, i, m.group(0)[:60]))
+        except OSError:
+            continue
     return hits
 
 

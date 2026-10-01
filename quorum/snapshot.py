@@ -46,15 +46,21 @@ def _git(repo: str, *args: str) -> Optional[str]:
 
 
 def take(cfg: Config) -> Snapshot:
+    """材料指纹。
+
+    git 仓库里**不能只看 HEAD**：`sources` / `snapshot_exclude` 会变成死配置，
+    而且同一份材料在「首次 commit 之前」是 `tree:…`、之后变成 `git:HEAD` —— 指纹算法随环境静默翻转。
+    现在两种模式都包含 **sources 的文件树哈希**；git 模式额外带上 HEAD 与工作区脏标记作为身份。
+    """
+    tree = _tree(cfg)
     head = _git(cfg.repo, "rev-parse", "HEAD")
-    if head:
-        status = _git(cfg.repo, "status", "--porcelain") or ""
-        if status:
-            d = hashlib.sha256((head + "\n" + status).encode()).hexdigest()[:12]
-            return Snapshot("git", "git:%s+dirty:%s" % (head[:12], d),
-                            "git 仓库，工作区**有未提交改动**（改动指纹 %s）" % d)
-        return Snapshot("git", "git:%s" % head[:12], "git 仓库，工作区干净")
-    return _tree(cfg)
+    if not head:
+        return tree
+    status = _git(cfg.repo, "status", "--porcelain") or ""
+    h = hashlib.sha256(("%s\n%s\n%s" % (head, status, tree.digest)).encode()).hexdigest()[:12]
+    detail = "git %s%s + 材料树 %s（%d 个文件）" % (
+        head[:12], "，工作区有未提交改动" if status else "，工作区干净", tree.digest, tree.files)
+    return Snapshot("git", "git:%s" % h, detail, tree.files)
 
 
 def _tree(cfg: Config) -> Snapshot:

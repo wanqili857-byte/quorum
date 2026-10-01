@@ -17,5 +17,6 @@ reviewers:
   - {name: beta,  channel: fake, family: vendor-b, role: primary, env: {FAKE_PERSONA: beta}}
   - {name: gamma, channel: fake, family: vendor-c, role: cross,   env: {FAKE_PERSONA: gamma}}
 
-# 门禁阈值调小，因为 canned 结论是缩微版；真实项目用默认值（2000B / 5 条标记）
-gates: {min_bytes: 300, min_severity_marks: 3, require_sections: ["最脆弱"]}
+# 门禁阈值调小，因为 canned 结论是缩微版；真实项目用默认值（2000B / 5 条发现）
+# 注意：数的是**解析出来的发现条数**，不是 emoji 出现次数
+gates: {min_bytes: 300, min_findings: 2, require_sections: ["最脆弱"]}

@@ -35,10 +35,38 @@ def main():
             pred = r["gold"] if rng.random() < 0.6 else rng.choice(LABELS)
             f.write(json.dumps({"id": r["id"], "pred": pred}) + "\n")
 
+    # 事故一（数字部分）：报告写「严格命中 41.0%」，而 41.0% 其实是**覆盖率**（41/100），
+    # 不是准确率——准确率是 31/41 = 75.6%（对全部 100 条则是 31.0%）。
+    # 作者把覆盖率当成了准确率，而**没有任何门禁**检查这件事。
+    pred = [json.loads(l) for l in open(os.path.join(DATA, "pred_old.jsonl"))]
+    gold = {r["id"]: r["gold"] for r in rows}
+    covered = len(pred)
+    hit = sum(1 for r in pred if gold.get(r["id"]) == r["pred"])
+    coverage = 100.0 * covered / len(rows)
+    acc_covered = 100.0 * hit / covered
+    acc_all = 100.0 * hit / len(rows)
+
     # 事故二：报告的数字区块是对的，区块外的正文被「回填脚本」擦光了。
     # 真因：open(path, "w").write(replace(path, ...)) —— open(...,"w") 先截断，函数再读，读到空。
     with open(os.path.join(HERE, "report.md"), "w", encoding="utf-8") as f:
-        f.write("<!-- METRICS:START -->\n严格命中 41.0%\n<!-- METRICS:END -->\n")
+        f.write("# 评测报告\n\n<!-- METRICS:START -->\n"
+                "严格命中 %.1f%%（held-out %d 条）\n" % (coverage, len(rows)) +
+                "<!-- METRICS:END -->\n")
+
+    # 复核用：把三个数都算出来（审核员据此复现事故一）
+    with open(os.path.join(HERE, "metrics.py"), "w", encoding="utf-8") as f:
+        f.write('''#!/usr/bin/env python3
+"""重算报告里的数字。审核员用它复现事故一。"""
+import json, os
+HERE = os.path.dirname(os.path.abspath(__file__))
+ans = {json.loads(l)["id"]: json.loads(l)["gold"]
+       for l in open(os.path.join(HERE, "data", "answers.jsonl"))}
+pred = [json.loads(l) for l in open(os.path.join(HERE, "data", "pred_old.jsonl"))]
+hit = sum(1 for r in pred if ans.get(r["id"]) == r["pred"])
+print("覆盖率（有预测的条数 / 全集）: %d/%d = %.1f%%" % (len(pred), len(ans), 100*len(pred)/len(ans)))
+print("准确率（在有预测的那些上）  : %d/%d = %.1f%%" % (hit, len(pred), 100*hit/len(pred)))
+print("准确率（把缺的算错，对全集）: %d/%d = %.1f%%" % (hit, len(ans), 100*hit/len(ans)))
+''')
 
     # 事故三：切分时遍历 set，字符串哈希每进程随机化 → 同参数重跑结果不同。
     with open(os.path.join(HERE, "build.py"), "w", encoding="utf-8") as f:

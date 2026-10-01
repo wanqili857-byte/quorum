@@ -8,7 +8,7 @@
 
 | 严重度 | 位置 | 问题 | 证据 | 建议 |
 |---|---|---|---|---|
-| 🔴 | `report.md`、`data/pred_old.jsonl` | **报表分母与预测文件不一致**：报 100 条、实测 41 条，且缺的那 59 条被静默当成不存在 | 我用 `comm` 比了两个文件的 id 集合，差集 59 条；`metrics` 的 `continue` 使分母缩到 41 | 缺预测即中止 |
+| 🔴 | `report.md`、`data/pred_old.jsonl` | **报表分母与预测文件不一致**：报「held-out 100 条」、实测只有 41 条有预测，缺的 59 条被静默当成不存在 | 我用 `comm` 比两个文件的 id 集合，差集 59 条；跑 `project/metrics.py` 得覆盖率 41.0%、准确率 75.6% | 缺预测即中止，或明确计为错并把两个数都印出来 |
 | 🟡 | `build.py` | **切分不可复现**：`ids = {r["id"] for r in rows}` 遍历 set，字符串哈希每进程随机化，固定 `Random(42)` 也救不回来 | 我用两个不同的 `PYTHONHASHSEED` 各跑一次 `python3 build.py`，输出的 `dev_ids` 不同 | 先 `sorted()` 再 shuffle；并把这条做成测试 |
 
 ## 最脆弱的一环（前三）

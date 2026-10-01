@@ -33,19 +33,28 @@ class GateResult:
     missing_sections: List[str]
     rc: int
     seconds: int
+    findings: int = 0
 
     def summary(self) -> str:
-        return ("%dB · 严重度标记 %d · 缺章节 %s · rc=%d · %ds"
-                % (self.size, self.marks, self.missing_sections or "无", self.rc, self.seconds))
+        return ("%dB · 发现 %d 条（标记 %d）· 缺章节 %s · rc=%d · %ds"
+                % (self.size, self.findings, self.marks,
+                   self.missing_sections or "无", self.rc, self.seconds))
 
 
 def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
+    """四道内容门。
+
+    ⚠️ **数的是解析出来的发现条数，不是 emoji 出现次数。** 旧版数 emoji，于是
+    「概述表里的 30 个 🔴 + 一句『最脆弱』+ 一堆句号」能凑出一份『合规』的空产出。
+    标记数只作为附注保留在结果里。
+    """
+    rows = split_table_rows(text)
     marks = len(SEVERITY_RE.findall(text))
     missing = [s for s in cfg.gates.require_sections if s not in text]
     passed = (len(text.encode()) >= cfg.gates.min_bytes
-              and marks >= cfg.gates.min_severity_marks
+              and len(rows) >= cfg.gates.min_findings
               and not missing)
-    return GateResult(passed, len(text.encode()), marks, missing, rc, seconds)
+    return GateResult(passed, len(text.encode()), marks, missing, rc, seconds, findings=len(rows))
 
 
 def run_with_timeout(argv: List[str], env: Dict[str, str], timeout_s: int,
@@ -83,6 +92,12 @@ def protect_existing(path: str) -> str:
     return ""
 
 
+def _snap_digest(snapshot_line: str) -> str:
+    import re as _re
+    m = _re.search(r"`([^`]+)`", snapshot_line or "")
+    return m.group(1) if m else "unknown"
+
+
 def header(cfg: Config, reviewer_name: str, snapshot_line: str, extra: str = "") -> str:
     r = cfg.reviewer(reviewer_name)
     lines = [
@@ -92,6 +107,7 @@ def header(cfg: Config, reviewer_name: str, snapshot_line: str, extra: str = "")
         % (cfg.brief, r.family, r.role, (" · " + r.label) if r.label else ""),
         "> 方式: 独立进程 headless（干净上下文，与作者会话无共享记忆）",
         snapshot_line,
+        "<!-- quorum:snapshot %s -->" % _snap_digest(snapshot_line),
     ]
     if extra:
         lines.append("> %s" % extra)
@@ -122,33 +138,111 @@ def read_text(path: str) -> str:
     return open(path, encoding="utf-8", errors="replace").read()
 
 
-def split_table_rows(text: str) -> List[Tuple[str, str, str, str]]:
-    """从结论里抽出「严重度 | 位置 | 问题 | 证据」四列。交叉表与处置台账都用它。
+COLUMN_NAMES = ("严重度", "位置", "问题", "证据", "建议")
 
-    刻意只认**表头含「严重度」的那张表**，避免把概述表也当成发现（我们真实踩过：
-    概述表里的 🟡 行会被误当成一条发现）。
+
+def _split_row(line: str) -> List[str]:
+    r"""按 markdown 规则切单元格：`\|` 是字面竖线，**反引号代码段内的 `|` 也不是分隔符**。
+
+    踩过：审核员在单元格里内嵌了一张表格（``审核员写成 `| # | 严重度 | 位置 |` ``），
+    朴素的 `split("|")` 把它切成一堆碎块，反而让这一行**看起来像表头**，
+    于是列映射被冲掉、后面整段发现被静默丢弃。LLM 审核员很少会记得转义竖线。
+    """
+    body = line.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|") and not body.endswith("\\|"):
+        body = body[:-1]
+    cells: List[str] = []
+    buf: List[str] = []
+    in_code = False
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\" and i + 1 < len(body):
+            buf.append(body[i + 1])
+            i += 2
+            continue
+        if ch == "`":
+            in_code = not in_code
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "|" and not in_code:
+            cells.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    cells.append("".join(buf))
+    return [c.strip() for c in cells]
+
+
+def _header_map(cells: List[str]) -> Dict[str, int]:
+    """若这行像表头则返回 {列名: 下标}，否则 {}。"""
+    m: Dict[str, int] = {}
+    for i, c in enumerate(cells):
+        key = c.strip("*` ").strip()
+        for want in COLUMN_NAMES:
+            if key.startswith(want) and len(key) <= len(want) + 6:
+                m.setdefault(want, i)
+    return m if len(m) >= 2 and "严重度" in m else {}
+
+
+def _looks_like_header(cells: List[str]) -> bool:
+    return bool(_header_map(cells))
+
+
+def split_table_rows(text: str) -> List[Tuple[str, str, str, str]]:
+    """从结论里抽出 (严重度, 位置, 问题, 证据)。交叉表与处置台账都用它。
+
+    **按列名映射，不按位置**：输出契约规定的是列名（严重度/位置/问题/证据），
+    审核员在左边加一列 `#` 是完全合理的写法——旧版按位置取，遇到这种写法会整份静默丢行。
+
+    只认**表头含「严重度」的那张表**，避免把概述表也当成发现。
     """
     rows: List[Tuple[str, str, str, str]] = []
     in_table = False
+    idx: Dict[str, int] = {}
+
+    def pick(cells: List[str], *names: str) -> str:
+        for n in names:
+            i = idx.get(n)
+            if i is not None and i < len(cells):
+                return cells[i]
+        return ""
+
     for line in text.splitlines():
         s = line.strip()
         if not s.startswith("|"):
             in_table = False
+            idx = {}
             continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
+        cells = _split_row(line)
         if len(cells) < 3:
             continue
-        if "严重度" in cells[0]:
-            in_table = True
+        # 表头判定必须**严**：至少两个列名，且该单元格本身很短。
+        # 踩过：数据行里出现「严重度」三个字（例如正文引用了这个列名）会被误判成表头，
+        # 于是列映射被冲掉、后面整段发现被静默丢弃（实测一份 23 条发现的结论只解析出 4 条）。
+        if not in_table or _looks_like_header(cells):
+            hdr = _header_map(cells)
+            if hdr:
+                in_table = True
+                idx = hdr
+                continue
+        if not in_table:
             continue
-        if set(cells[0]) <= set("-: "):
+        if set("".join(cells)) <= set("-: "):
             continue
         if not in_table:
             continue
-        sev = cells[0]
+        if "严重度" not in idx:
+            continue
+        sev = pick(cells, "严重度")
         if not SEVERITY_RE.search(sev):
             continue
-        rows.append((sev, cells[1], cells[2], cells[3] if len(cells) > 3 else ""))
+        rows.append((sev, pick(cells, "位置"), pick(cells, "问题"), pick(cells, "证据")))
     return rows
 
 

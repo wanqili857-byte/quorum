@@ -6,3 +6,5 @@ build/
 dist/
 .venv/
 demo/out/
+out/
+reviews/out/
