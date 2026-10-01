@@ -22,7 +22,7 @@ from typing import Dict, List, Tuple
 
 from .config import Config
 
-SEVERITY_RE = re.compile(r"🔴|🟡|🟢|\[高\]|\[中\]|\[低\]")
+SEVERITY_RE = re.compile(r"🔴|🟠|🟡|🟢|\[严重\]|\[高\]|\[中\]|\[低\]")
 
 # 「审核员卡住了」与「审核员交了个差结论」在门禁看来长得一样，但处置完全不同：
 # 前者要你解封权限/换通道再跑，后者要重写工单或换模型。这里给前者一个可识别的信号。
@@ -60,7 +60,9 @@ def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
     「概述表里的 30 个 🔴 + 一句『最脆弱』+ 一堆句号」能凑出一份『合规』的空产出。
     标记数只作为附注保留在结果里。
     """
-    rows_all = split_table_rows(text)
+    stats: Dict[str, int] = {}
+    rows_all = split_table_rows(text, stats)
+    dropped = stats.get("dropped_severity", 0)
     # 只数**有实质内容**的发现：problem 列至少 8 个字符。
     # 旧版只堵死了 emoji 刷屏，没堵死「表里塞 30 行空话」——那同样是空产出。
     rows = [r for r in rows_all if len(r[2].strip()) >= 8]
@@ -87,6 +89,23 @@ def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
                     "标题式结论（`### F1 …`）会被判 0 条。工单的输出契约已写明要表格")
         else:
             hint = "未解析到任何发现行"
+    # **过了门禁也要出声**：列名对不上不会让门禁失败，只会让交叉表的「位置」列
+    # 静默变空——实测 25 行全空、零报错，而交叉表正是按位置对齐的，位置空了对齐
+    # 就退化成纯文本相似度。hint 在 summary() 里只要非空就会打印，与过没过门禁无关。
+    # **丢行必须可见**：严重度标记认不出时旧版静默跳过整行，于是「发现 8 条」
+    # 可以其实是 17 条——工具少报一半还判 ok（canonbench 第二轮实测：工单写
+    # 🔴/🟠/🟡/🟢，正则不认 🟠，46 条只进来 30 条）。这条与过没过门禁无关，
+    # 所以放在 hint 里由 summary() 无条件打印。
+    if dropped:
+        warn2 = ("另有 %d 行看着是发现行，但严重度列没有可识别的标记，已丢弃"
+                 "（认：%s）。门禁不受影响，但**条数与交叉表都少算了**"
+                 % (dropped, SEVERITY_RE.pattern.replace("|", " / ")))
+        hint = (hint + "；" + warn2) if hint else warn2
+    if rows and not any(r[1] for r in rows):
+        warn3 = ("发现 %d 条，但「位置」列全空——表头里那一列的名字没被认出来"
+                 "（认：%s）。不挡门禁，但交叉表按位置对齐会退化"
+                 % (len(rows), " / ".join(COLUMN_ALIASES["位置"])))
+        hint = (hint + "；" + warn3) if hint else warn3
     return GateResult(passed, len(text.encode()), marks, missing, rc, seconds,
                       findings=len(rows), blocked=blocked, hint=hint)
 
@@ -177,6 +196,19 @@ def read_text(path: str) -> str:
 
 COLUMN_NAMES = ("严重度", "位置", "问题", "证据", "建议")
 
+# 列名**别名**：契约规定的名字是「位置/证据」，但工单骨架是人写的，写法差别很大。
+# 实测（canonbench 第二轮）：工单表头写的是
+# `| # | 文件:行 | 问题 | 具体失败场景 | 严重度 | 怎么查出来的 |`，
+# 于是 25 条发现的「位置」**全空且一声不吭**，交叉表按位置对齐直接退化。
+# 这类写法是合理的——工具该认，不是让作者去改自己的习惯。
+COLUMN_ALIASES = {
+    "严重度": ("严重度", "severity", "等级", "级别"),
+    "位置": ("位置", "文件:行", "文件", "路径", "location", "file"),
+    "问题": ("问题", "issue", "problem"),
+    "证据": ("证据", "怎么查出来的", "查证", "复现", "命令", "evidence"),
+    "建议": ("建议", "fix", "suggestion"),
+}
+
 
 def clip_cell(s: str, n: int) -> str:
     r"""把一段文本裁成 n 字符以内，用作 markdown 表格的单元格。
@@ -240,14 +272,20 @@ def _split_row(line: str) -> List[str]:
 
 
 def _header_map(cells: List[str]) -> Dict[str, int]:
-    """若这行像表头则返回 {列名: 下标}，否则 {}。"""
+    """若这行像表头则返回 {规范列名: 下标}，否则 {}。
+
+    匹配走**别名表**（`COLUMN_ALIASES`），返回的键一律是规范名——
+    下游 `pick(cells, "位置")` 因此不必知道审核员那列叫什么。
+    """
     m: Dict[str, int] = {}
     for i, c in enumerate(cells):
         key = c.strip("*` ").strip()
-        for want in COLUMN_NAMES:
-            # 列名后面常带修饰（`严重度（🔴🟡🟢）`、`证据（命令/重算结果）`）——放宽到 +14
-            if key.startswith(want) and len(key) <= len(want) + 14:
-                m.setdefault(want, i)
+        for canon, aliases in COLUMN_ALIASES.items():
+            for want in aliases:
+                # 列名后面常带修饰（`严重度（🔴🟡🟢）`、`证据（命令/重算结果）`）——放宽到 +14
+                if key.startswith(want) and len(key) <= len(want) + 14:
+                    m.setdefault(canon, i)
+                    break
     return m if len(m) >= 2 and "严重度" in m else {}
 
 
@@ -255,17 +293,23 @@ def _looks_like_header(cells: List[str]) -> bool:
     return bool(_header_map(cells))
 
 
-def split_table_rows(text: str) -> List[Tuple[str, str, str, str]]:
+def split_table_rows(text: str, stats: Dict[str, int] = None) -> List[Tuple[str, str, str, str]]:
     """从结论里抽出 (严重度, 位置, 问题, 证据)。交叉表与处置台账都用它。
 
     **按列名映射，不按位置**：输出契约规定的是列名（严重度/位置/问题/证据），
     审核员在左边加一列 `#` 是完全合理的写法——旧版按位置取，遇到这种写法会整份静默丢行。
 
     只认**表头含「严重度」的那张表**，避免把概述表也当成发现。
+
+    `stats` 传入字典时回填被丢弃的行数（`dropped_severity`）——**丢行必须能被看见**：
+    实测（canonbench 第二轮）严重度正则不认 🟠，而工单明写「严重度用 🔴/🟠/🟡/🟢」，
+    于是 46 条发现只解析出 30 条，其中一家 17 条只进了 8 条，**门禁照样判 ok**。
+    工具少报一半而说自己 ok，比报错更糟。
     """
     rows: List[Tuple[str, str, str, str]] = []
     in_table = False
     idx: Dict[str, int] = {}
+    dropped = 0
 
     def pick(cells: List[str], *names: str) -> str:
         for n in names:
@@ -302,13 +346,20 @@ def split_table_rows(text: str) -> List[Tuple[str, str, str, str]]:
             continue
         sev = pick(cells, "严重度")
         if not SEVERITY_RE.search(sev):
+            # 看着像发现行却没有可识别的严重度标记——**记数，别静默扔**
+            if len(cells) >= 3 and any(c.strip() for c in cells[1:]):
+                dropped += 1
             continue
         rows.append((sev, pick(cells, "位置"), pick(cells, "问题"), pick(cells, "证据")))
+    if stats is not None:
+        stats["dropped_severity"] = dropped
     return rows
 
 
 def severity_of(sev: str) -> int:
-    if "🔴" in sev or "[高]" in sev:
+    if "🔴" in sev or "[严重]" in sev or "[高]" in sev:
+        return 4
+    if "🟠" in sev:
         return 3
     if "🟡" in sev or "[中]" in sev:
         return 2
