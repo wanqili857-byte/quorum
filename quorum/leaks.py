@@ -92,6 +92,28 @@ def _compile(patterns: List[Pattern]) -> List[Tuple[Pattern, "re.Pattern"]]:
 # 扫描时默认跳过它，否则公开仓永远过不了自己的门禁。这是唯一一处豁免，理由写在这里。
 FIXTURE_FILE = os.path.abspath(__file__)
 
+# ⚠️ 光有路径不够。**跳过必须按内容认，不能按路径认。**
+#
+# 真实踩到（2026-10-02）：`quorum check-leaks .` 在仓库里 **rc=1**、在 CI 里 **rc=0**。
+# 同一份代码、同一份材料，差别只在 **quorum 是怎么被装上去的**：
+#   · CI 用 `pip install -e '.[dev]'` → `__file__` 就是仓库里那份 → 路径相等 → 跳过生效；
+#   · 本地用 `uv tool install`（**拷贝**到 site-packages）→ `FIXTURE_FILE` 指向 site-packages，
+#     而被扫的是源码树 → 路径**不相等** → 仓库自己那份 `leaks.py` 被当成材料，
+#     里面那串样例（`sk-abc…` / `13800138000` / `someone@example.com`）全被报成真命中。
+#
+# 这和 `docs/LESSONS.md` 那条是同一族：「门禁的结果不该取决于它是怎么被装上去的」。
+# 现在两条都留着：路径相等（快路径）+ **内容标记**（不依赖装法）。
+FIXTURE_MARKER = "quorum-leaks-fixture-table-only-here"
+
+
+def _is_fixture_file(path: str, text: str) -> bool:
+    """这个文件是不是「检测器自己的样例表」？
+
+    两个条件都要：文件名是 `leaks.py`，**且**内容里有 `FIXTURE_MARKER`。
+    只看文件名会误伤同名的第三方文件；只看标记则太宽。
+    """
+    return os.path.basename(path) == "leaks.py" and FIXTURE_MARKER in text
+
 
 def tracked_files(root: str) -> List[str]:
     """git 仓库 → 返回**被跟踪**的文件；否则返回 []（调用方回落到 os.walk）。
@@ -138,21 +160,26 @@ def scan(root: str, patterns: List[Pattern], max_hits: int = 5,
                 else:
                     skipped.append(os.path.relpath(p, root))
     for p, rel in candidates:
-        if os.path.abspath(p) in skip_files or not os.path.exists(p):
+        if not os.path.exists(p):
             continue
         if not _is_text(p):
             skipped.append(rel)          # 静默跳过 = 静默盲区：二进制/超大/非 UTF-8 的文件必须报出来
             continue
         try:
-            for i, line in enumerate(open(p, encoding="utf-8", errors="ignore"), 1):
-                for pat, rx in compiled:
-                    m = rx.search(line)
-                    if m:
-                        hits.setdefault(pat.name, [])
-                        if len(hits[pat.name]) < max_hits:
-                            hits[pat.name].append((rel, i, m.group(0)[:60]))
+            with open(p, encoding="utf-8", errors="ignore") as fh:
+                raw = fh.read()          # 有 MAX_FILE_BYTES 兜着，读整份是安全的
         except OSError:
             continue
+        # 跳过「检测器自己的样例表」：**按内容认，不按路径**。理由见 FIXTURE_FILE 上面那段。
+        if os.path.abspath(p) in skip_files or _is_fixture_file(p, raw):
+            continue
+        for i, line in enumerate(raw.splitlines(), 1):
+            for pat, rx in compiled:
+                m = rx.search(line)
+                if m:
+                    hits.setdefault(pat.name, [])
+                    if len(hits[pat.name]) < max_hits:
+                        hits[pat.name].append((rel, i, m.group(0)[:60]))
     return hits
 
 

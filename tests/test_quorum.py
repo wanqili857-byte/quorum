@@ -788,3 +788,33 @@ def test_check_env_prefers_the_project_venv(tmp_path):
         "没有 .venv 时不许往 PATH 里塞一个不存在的目录"
     assert parts[0] == os.path.dirname(os.path.abspath(sys.executable)), \
         "没有项目 venv 时退回旧语义：用跑 quorum 的那个解释器"
+
+
+def test_check_leaks_skips_its_fixture_by_content_not_path(tmp_path):
+    """自跳过必须**按内容认**，不能按路径认。
+
+    真实事故（2026-10-02）：同一份仓库，`quorum check-leaks .` **本地 rc=1、CI rc=0**。
+    差别只在 quorum 是**怎么被装上去的**：CI 是 `pip install -e`（`__file__` 就是仓库里那份），
+    本地是 `uv tool install`（**拷贝**到 site-packages）→ `FIXTURE_FILE` 指向 site-packages，
+    而被扫的是源码树 → 路径不相等 → 仓库自己那份 `leaks.py` 里的样例串全被报成真命中。
+
+    这里直接模拟那场景：把模块源码**复制到别处**再扫——必须仍然跳过，
+    同时**真的泄漏必须照样被扫出来**（否则就是把门禁整个关掉了）。
+    """
+    dst = tmp_path / "quorum"
+    dst.mkdir()
+    shutil.copy(os.path.join(ROOT, "quorum", "leaks.py"), dst / "leaks.py")
+    # 邮箱**拼出来**，不写字面量——否则这行本身会被仓库自己的 check-leaks 扫到，
+    # 而这个仓库唯一的豁免是「leaks.py 自己」。（我第一版就踩了：改完 rc 从 0 变 1。）
+    fake_mail = "someone" + "@" + "realmail.com"
+    (tmp_path / "real.txt").write_text("联系 %s\n" % fake_mail, encoding="utf-8")
+
+    pats = leaks.default_patterns("someoneelse")
+    hits = leaks.scan(str(tmp_path), pats, skip_files=(leaks.FIXTURE_FILE,))
+
+    assert "邮箱" in hits, "真的泄漏没被扫出来——跳过范围过宽了，等于把门禁关掉"
+    rows = hits["邮箱"]
+    # 元组是 (相对路径, 行号, 命中片段) —— 中间那个是**行号**，别拿它当路径
+    assert any(r[0].endswith("real.txt") for r in rows), "real.txt 的邮箱没被扫到"
+    assert not any("leaks.py" in r[0] for r in rows), \
+        "复制到别处的 leaks.py 没被跳过（这正是本地 rc=1 的原因）：%r" % (rows,)
