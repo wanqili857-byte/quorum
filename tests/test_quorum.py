@@ -608,6 +608,32 @@ def test_ledger_row_survives_unclosed_code_span():
         "骨架行被切成 %d 格，应为 %d 格：%r" % (len(gates._split_row(row)), header_cols, row[-60:])
 
 
+def test_location_column_is_clipped_too_not_just_headline():
+    """`位置` 列也必须走 `clip_cell` —— 它和「问题」列一样是表格单元格。
+
+    上面那条只保住了 **headline** 那一列；位置列当时还是裸切片 `[:50]`，于是同一类事故
+    换个列又发生了一次：位置写成
+    `` `assemble.py:257-260, 496-509`（`MUST_TONES`/`NICE_ ``（第 50 字正好落在代码段里），
+    未被闭合的反引号让 `_split_row` 把后面全吞进同一格 —— **那两行的 `status` 直接消失**，
+    `verify` 报「无断言 6 条」而作者以为自己填了 5 条。
+
+    教训：上一轮修了「一处」，就以为修了「一类」。**同类的第二列没人去看。**
+    """
+    loc = "`assemble.py:257-260, 496-509`（`MUST_TONES`/`NICE_TONES` 这两个判定表）"
+
+    class _C:
+        project = "t"
+    c = plate.Cluster(rows=[plate.Row("x", "v", "h", "🟢", loc, "问题正文足够长" * 4, "")])
+    c.members = [0]
+
+    txt = plate.dispose_skeleton(_C(), [c])
+    row = [l for l in txt.split("\n") if l.startswith("| 1 |")][0]
+    header_cols = len(txt.split("\n")[6].split("|")) - 2
+    assert len(gates._split_row(row)) == header_cols, \
+        "位置列被切断代码段 → 行被切成 %d 格，应为 %d 格：%r" % (
+            len(gates._split_row(row)), header_cols, row[-60:])
+
+
 # ------------------------------------------------------------------ 并发
 # 「并发」不能靠读代码断言，得让进程自己留证据：每个桩把 (起, 止) 写进同一个文件，
 # 跑完看这些区间有没有重叠。串行 → 永不相交；并发 → 必有相交。

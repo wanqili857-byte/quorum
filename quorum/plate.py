@@ -271,12 +271,13 @@ def render(cfg: Config, clusters: List[Cluster], snaps: Dict[str, str]) -> str:
             "| # | 一致度 | 严重度 | 位置 | 一句话 | 哪几家 |", "|---|---|---|---|---|---|"]
     for i, c in enumerate(clusters, 1):
         out.append("| %d | %s | %s | %s | %s | %s |" % (
-            i, c.label(), c.severity, c.rows[0].location[:50],
+            i, c.label(), c.severity, clip_cell(c.rows[0].location, 50),
             clip_cell(c.headline(), 80), "+".join(c.reviewers)))
 
     out += ["", "## 明细（**每家原话都列出来**——合并只说明「说的是同一处」，不说明「结论相同」）", ""]
     for i, c in enumerate(clusters, 1):
-        out.append("### %d. %s · %s · 位置 `%s`" % (i, c.severity, c.label(), c.rows[0].location[:60]))
+        out.append("### %d. %s · %s · 位置 `%s`" % (
+            i, c.severity, c.label(), clip_cell(c.rows[0].location, 60).replace("`", "")))
         out.append("")
         for r in c.rows:
             out.append("- **%s**（%s @ %s）：%s" % (r.reviewer, r.vendor, r.harness,
@@ -334,6 +335,6 @@ def dispose_skeleton(cfg: Config, clusters: List[Cluster]) -> str:
            "|---|---|---|---|---|---|---|---|"]
     for i, c in enumerate(clusters, 1):
         out.append("| %d | %s | %s | %s | %s | | | ⬜ |" % (
-            i, c.label(), c.severity, c.rows[0].location[:50],
+            i, c.label(), c.severity, clip_cell(c.rows[0].location, 50),
             clip_cell(c.headline(), 100)))
     return "\n".join(out) + "\n"
