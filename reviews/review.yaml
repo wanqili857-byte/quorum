@@ -1,40 +1,108 @@
-# quorum 审自己 —— 第一次跑真通道。
+# quorum 审自己 —— 第 4 轮（2026-10-02）。
+#
+# ⚠️ 前三轮的自审作废了（见 CORRECTIONS.md）：配置里写着三个来源，实际三条通道
+# **全部由同一个模型服务**——两个 claude-cli 通道声明的 ANTHROPIC_* 从未生效，
+# 被 CLI 自己的用户级 settings 盖过。所以这是**第一轮两个轴都真的跨开**的审核。
+#
+# 本轮只有两个审核员。**这是刻意的**：宁可两个真的独立，也不要三个假的。
+# 而且这两个在**四个维度**上都不同：
+#   vendor（moonshot / openai）· harness（claude-cli / opencode-cli）
+#   端点（火山 Ark / OpenCode Go）· 生态（中国 / 美国）
 project: quorum
 repo: ..
 brief: brief.md
 out_dir: out
 ledger: dispose.md          # 相对本文件 → reviews/dispose.md
-sources: ["quorum", "tests", "demo", "docs", "templates", "CONTRACT.md", "README.md"]
-snapshot_exclude: ["reviews/out", ".venv", "__pycache__"]
+sources: ["quorum", "tests", "demo", "docs", "templates",
+          "CONTRACT.md", "README.md", "reviews"]
+snapshot_exclude: ["reviews/out", "demo/out", ".venv", "__pycache__"]
+# ⚠️ `demo/out` 是 2026-10-02 补上的，它是一次**假警报**的根因。
+# 工单让审核员跑 `bash demo/run_demo.sh`，而 `demo` 在 `sources` 里；`demo/out/` 是它的产出目录
+# （已被 .gitignore 挡住）却**不在排除表里**。于是审核员一跑 demo，材料指纹就变 ——
+# 结论头部被写上「材料在审核期间发生变化」，而实际上改变的是**审核自己产生的产物**。
+# 实测确认：往 `demo/out` 写一个文件，`snapshot.take()` 的指纹就会变。
+# 教训与「假警报淹没真警报」同源：一条**必然触发**的告警等于没有告警。
 
 channels:
-  ark:                                  # 任何 Anthropic 兼容端点都能接
+  ark-kimi:
     kind: claude-cli
     model: kimi-k2.7-code
+    args:
+      # ⚠️ `--setting-sources project` **不是可选的**。CLI 的用户级 settings 会**盖过
+      # 进程环境变量**，于是下面那几个 ANTHROPIC_* 全部无效、请求被送进本机代理。
+      # 前三轮自审就是这么废掉的（三个「独立来源」实为一个模型）。
+      # 跳过 user 层之后进程环境变量才真正生效。
+      # 兜底不是这条注释，是 `quorum preflight`——它用一条**故意错的凭据**反证这件事。
+      - "--setting-sources"
+      - "project"
+      - "--allowedTools"
+      # 最小授权：只读文件 + 跑这个仓库自己的测试与命令。不含写、删、网络。
+      # 工单要求审核员**真跑** pytest 与 demo，所以这两类必须放行；
+      # 不放行的后果很隐蔽：审核员会说「命令需批准」，然后**改用心算顶替执行**。
+      - "Read,Glob,Grep,Bash(python3:*),Bash(pytest:*),Bash(quorum:*),Bash(bash:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(grep:*),Bash(diff:*),Bash(md5:*),Bash(git log:*),Bash(git diff:*)"
     env:
       ANTHROPIC_BASE_URL: https://ark.cn-beijing.volces.com/api/coding
       ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/ark_key
+      ANTHROPIC_MODEL: kimi-k2.7-code
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000"
       CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144"
-  dashscope:
-    kind: claude-cli
-    model: qwen3.8-flash
+
+  ocg-luna:
+    kind: opencode-cli
+    # 模型名要带 provider 前缀：opencode 内置认识 `opencode/gpt-6-luna`
+    # （官方 Endpoint 表里它走 `/v1/responses`，只有 opencode 这类自带协议适配的
+    #  harness 接得了——claude-cli 与 codex-cli 都接不了它）。
+    model: opencode/gpt-6-luna
     env:
-      ANTHROPIC_BASE_URL: https://dashscope.aliyuncs.com/apps/anthropic
-      ANTHROPIC_AUTH_TOKEN: ${QWEN_API_KEY}
-      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144"
-  codex:
-    kind: codex-cli
+      OPENCODE_API_KEY_FILE: ~/.config/opencode_go_key
+      # ⚠️⚠️ `permission` 是**必填**，而且这条是拿一整轮换来的。
+      #
+      # 2026-10-02 第一次跑这个通道：审核员交了 473 字节的**过程叙述**（「我先读取…我正在对照…」），
+      # 0 条发现，而**退出码是 0**。原始日志里两行：
+      #     ! permission requested: external_directory (<父目录>/templates/*); auto-rejecting
+      #     Error: The user rejected permission to use this specific tool call.
+      # opencode 的默认权限里 `external_directory` 是 `"ask"`，而 headless 跑**没有人能批准**
+      # → 工具调用被自动拒绝 → 审核员卡住。
+      #
+      # 所以这里写死一组策略。`channels.build` 会**拒绝启动**没有 `permission` 的
+      # opencode-cli 通道 —— 因为「权限来自用户级配置」正是这个工具栽过的那个坑。
+      #
+      # 这组授权和 claude-cli 那条**对齐**（只读工具 + bash + 子代理；禁写、禁对外）；
+      # 额外多一条 claude-cli 给不了的：`external_directory: deny`，
+      # 也就是**明确禁止读到工作目录之外**。
+      # `read` 用对象写法是为了保住 opencode 自带的「默认不读 .env」——
+      # 写成 `"read": "allow"` 会把那条保护一起关掉。
+      OPENCODE_CONFIG_CONTENT: |
+        {"permission": {
+          "*": "deny",
+          "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
+          "glob": "allow", "grep": "allow", "bash": "allow", "task": "allow",
+          "edit": "deny", "webfetch": "deny", "websearch": "deny",
+          "external_directory": "deny", "question": "deny", "skill": "deny"}}
+      # ⚠️ 这条**不是可选的**，而且它是**同一类失败的第二个实例**。
+      #
+      # opencode 的登录态存在 `$XDG_DATA_HOME/opencode/auth.json`，**优先级高于**
+      # `OPENCODE_API_KEY` 环境变量。实测（2026-10-02）：
+      #   有 auth.json 时 → **坏 key 也照样回话**（= 请求没走我们声明的那个 key）
+      #   指向空目录后 → 坏 key 立刻 rc=1（= 凭据真的被用上了）
+      # 换句话说：进程环境变量被用户的本地存储盖过 —— 和 claude-cli 那边
+      # `~/.claude/settings.json` 盖过 `ANTHROPIC_*` **是完全同一个形状**，
+      # 只是换了一个 harness。
+      #
+      # 指向一个 quorum 自己的目录，让这个通道的凭据**只有一个来源**。
+      # 顺带把 opencode 的会话历史也隔离掉了（复核本来就该是无历史的）。
+      XDG_DATA_HOME: ~/.cache/quorum/opencode-data
+      # 不拉 models.dev 注册表：本机对外网络要过代理，实测没有它时 opencode 会在这一步
+      # 一直挂着，把审核员的整个 timeout 耗光。`opencode/gpt-6-luna` 是内置 provider，
+      # 不依赖注册表（实测开与关都能正常解析）。
+      OPENCODE_DISABLE_MODELS_FETCH: "1"
 
 reviewers:
-  # vendor 决定 COI：同一 vendor 不得有两个 primary（同源模型看不出同源盲区）
+  # 两个 primary，vendor 不同 → 过 COI 校验。
   #
-  # ⚠️ 看这两个轴：kimi 与 qwen 的 **vendor 不同，但 harness 相同**（都走 claude-cli）。
-  # 它们的共识可能来自 Claude Code 这套 loop（同一 system prompt、同一工具、同一种套路），
-  # 而不只是来自两个独立模型。codex 才是另一个 harness。
-  # 旧版只记 vendor，plate 会打出「跨模型族一致 · 高置信」，读者容易以为买到了两维独立。
-  - {name: kimi,  channel: ark,       vendor: moonshot, role: primary, timeout_s: 2400}
-  - {name: qwen,  channel: dashscope, vendor: qwen,     role: primary, timeout_s: 2400, label: "第一轮就用过的审核员"}
-  - {name: codex, channel: codex,     vendor: deepseek, role: cross,   timeout_s: 2400}
+  # ⚠️ `vendor` 是**声明**，工具验证不了。上一轮就是栽在这一点上。
+  # 现在能验的只有「请求确实经过了声明的端点」，验不了「那边回话的是谁」。
+  - {name: kimi, channel: ark-kimi, vendor: moonshot, role: primary, timeout_s: 2700}
+  - {name: luna, channel: ocg-luna, vendor: openai,   role: primary, timeout_s: 2700}
 
 gates: {min_bytes: 2000, min_findings: 5, require_sections: ["最脆弱"]}

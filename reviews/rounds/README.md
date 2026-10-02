@@ -1,6 +1,21 @@
 # 三轮自审的原始结论
 
-三个真通道（kimi / qwen / codex），同一份工单 `../brief.md`，同一份材料。
+> ## ⚠️ 更正（2026-10-02）：这三轮不是「三个来源」
+>
+> 配置里写着 kimi / qwen / codex 三个通道，**实际三条全部由同一个模型服务**。
+> 两个 `claude-cli` 通道声明的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
+> **从未生效**——进程环境变量被 CLI 自己的用户级 settings 盖过，请求被送进本机代理，
+> 由它按自己的 provider 路由。codex 那条没有被劫持，但它的 `request_model` 本来就与
+> 实服务同名，**所以三条的实服务是同一个模型**。
+>
+> 真实的形状是 **1 个 vendor × 2 个 harness**（`claude-cli` / `codex-cli`），
+> 不是「三个不同模型族」。**harness 那一轴是真的**；vendor 那一轴是假的。
+>
+> **发现本身保留**——它们是关于代码的，逐条对着源码核过，与谁审的无关。
+> 作废的只是**置信度**那一列。原委与证据：[`../CORRECTIONS.md`](../CORRECTIONS.md)。
+
+三个通道（kimi / qwen / codex）——**通道名属实，模型名不属实，见上**——
+同一份工单 `../brief.md`，同一份材料。
 
 | 轮 | 材料修订 | 拿到什么 |
 |---|---|---|

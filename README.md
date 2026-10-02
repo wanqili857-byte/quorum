@@ -3,11 +3,16 @@
 **让几个不同厂商的模型互相挑错，把「审核」从一次性动作变成可证伪的回归。**
 
 ```bash
+quorum preflight --config review.yaml --all   # 阴性对照：证明每条通道真打到它声明的端点（能拦人）
 quorum run    --config review.yaml --all      # 起独立进程审核（干净上下文，默认全部并发）
 quorum plate  --config review.yaml --dispose  # 交叉表：一致 / 独有 · 导出处置台账
 quorum verify --config review.yaml            # 跑台账里的断言 → 抓「台账说谎」
 quorum check-leaks .                          # 泄漏自检（公开仓的守门人）
 ```
+
+> `run` 起审核员**之前**会自动跑一次 `preflight`。它拦的是这个工具唯一一种
+> **在后续任何环节都看不出来**的失败：通道的凭据没生效，请求被路由到了别处，
+> 而结论还挂着配置里声明的来源标签。详见下面「凭据没生效」一节。
 
 ---
 
@@ -81,16 +86,25 @@ channels:
       ANTHROPIC_BASE_URL: https://<你的端点>
       ANTHROPIC_AUTH_TOKEN_FILE: ~/.config/<密钥文件>   # 密钥只给路径，内容不进配置
   codex:
-    kind: codex-cli
+    kind: codex-cli                         # 只认 responses 协议；只给 chat/completions 的端点接不了
+  opencode:
+    kind: opencode-cli                      # 官方 opencode harness：自带协议适配
+    model: <provider>/<模型名>
+    env:
+      ARK_KEY_FILE: ~/.config/<密钥文件>
+      OPENCODE_CONFIG_CONTENT: |
+        {"provider": {"<provider>": {"npm": "@ai-sdk/openai-compatible",
+          "options": {"baseURL": "https://<端点>/v1", "apiKey": "{env:ARK_KEY}"},
+          "models": {"<模型名>": {}}}}}
   any-cli:
     kind: exec                              # 任何别的 CLI，不用改库源码
     harness: my-agent                       # exec 必须自己起 harness 名
     argv: ["my-agent", "--read-only", "-C", "{repo}", "-p", "{prompt}"]
 
 reviewers:
-  - {name: a, channel: ark,     vendor: <模型来源A>, role: primary}
-  - {name: b, channel: any-cli, vendor: <模型来源B>, role: primary}
-  - {name: c, channel: codex,   vendor: <模型来源C>, role: cross}
+  - {name: a, channel: ark,      vendor: <模型来源A>, role: primary}
+  - {name: b, channel: opencode, vendor: <模型来源B>, role: primary}
+  - {name: c, channel: codex,    vendor: <模型来源C>, role: cross}
 ```
 
 ### 两条来源轴，别把它们混成一个
@@ -120,24 +134,80 @@ reviewers:
 `vendor` 是 COI 规则的载体：**同一 vendor 不能有两个 primary**（同源模型看不出同源的盲区），
 配置违反会直接报错。
 
+### 凭据没生效：唯一一种「事后看不出来」的失败
+
+上面那张表里，`vendor` 那一栏写着**声明**——工具验证不了。这句话曾经只是句话，
+直到它真的发生了：
+
+> 四条通道声明了四个厂商的模型。**连续四轮复核，请求全部由同一个模型服务。**
+> 根因是 CLI 读了自己的用户级 settings，`env` 段盖过了 runner 传进去的进程环境变量，
+> 于是配置里那几个 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` **一次都没生效**。
+> 台账里每一行都写着「跨模型族一致 · 高置信」。
+>
+> 四轮没有一轮审出来——**因为「审核员是谁」这件事根本不在于审核员的视野里**，
+> 它写在审核员读不到的配置里。审核员的输出、结论、证据全部自洽，他们只是不知道自己是谁。
+
+所以 `run` 起审核员之前会先跑一次 `quorum preflight`，每条通道发两次极小的请求：
+
+| | 怎么发 | 期望 |
+|---|---|---|
+| **阳性对照** | 真凭据 | **必须**回话，否则这条通道是死的，预检对它无从判断 |
+| **阴性对照** | 同样的 argv、同样的端点，**只把凭据换成故意错的** | **不许**回话 |
+
+阴性那条是关键：**「拿错凭据也照样回话」对正确的实现是不可能发生的**，
+所以它不是启发式，是一条能红的断言。而它恰好精确命中上面那种症状。
+只有阴性是不够的——真实 CLI 拿到坏凭据未必报错，可能只是**挂住**，
+那样「没成功」就同时对应「被拒」和「通道是死的」，两者混成同一档。
+
+**它证明什么、不证明什么**（别读大）：
+
+- 证得了：这一路请求确实经过了它声明的那个端点（凭据在那里被校验）。
+- 证不了：**模型是谁**。
+
+所以还有**第二条轴**：再发一次极小请求，读**应答里带的模型名**，和声明的比对。
+它抓的是**别名映射**——第三方端点普遍有一层，声明 `glm-5.3-pro` 回来的可能是 `glm-5.3`。
+也就是说你以为买的档位和实际拿到的可能不是一回事，而这件事在结论里完全看不出来。
+
+**第二条轴会做归一化，否则全是假警报**：`glm-5.3-flash` → `glm-5-3-flash`（点转横线）、
+`-260915` 这类日期后缀被剥——都不是换模型。一条每次都响的警报会被学会无视。
+
+`mismatch` **不拦人**（那是配置选择问题）；拦人只留给 `hijacked`——
+**没有别的检测手段**的那一种。判不了的档（`no_credential` / `channel_down` /
+端点藏在 CLI 自己注册表里的 `unverifiable`）也都不拦，但报告会明说「这次没验过」——
+「没查到问题」和「没查」在输出里必须长得不一样。
+
 ### 模型和 harness 都是你自己接的
 
 **quorum 不自带任何模型，也不自带任何 harness。** `kind` 描述的是「怎么起一个进程」——
-`claude-cli` / `codex-cli` 只是两种内置起法，`exec` 是通用入口（自己写 argv，接任何 CLI），
-`fake` 是测试桩。底下跑谁的模型、用哪个 agent CLI，由**你的配置**决定，工具不解释也不验证。
+`claude-cli` / `codex-cli` / `opencode-cli` 是三种内置起法，`exec` 是通用入口（自己写 argv，
+接任何 CLI），`fake` 是测试桩。底下跑谁的模型、用哪个 agent CLI，由**你的配置**决定，
+工具不解释也不验证。
+
+内置三种起法覆盖的**协议面**不同，选哪个由你的端点决定：
+
+| 起法 | 能吃 |
+|---|---|
+| `claude-cli` | 任何 Anthropic 兼容端点 |
+| `codex-cli` | 只认 `responses`；**只给 chat/completions 的端点接不了** |
+| `opencode-cli` | 自带协议适配，**编码套餐那种只给 chat/completions 的端点也能接** |
+
+最后一行是为什么要内置三种而不是两种：很多**订阅制编码套餐**只开 chat/completions，
+于是「全用订阅跑」和「harness 那一轴也跨开」会变成二选一——而那是个假两难，
+补一个自带适配的 harness 就同时成立。
 
 库代码里没有任何厂商名；上面的 `<模型来源A>` 与 README 里出现的例子都只是例子，不是选项全集。
 详见 [`examples/`](examples/)。
 
-## 四条契约
+## 五条契约
 
-引擎一千多行（`wc -l quorum/*.py` 现算），读到这儿你大概已经能猜到它长什么样——**真正起作用的是下面这四条契约**：
+引擎一千多行（`wc -l quorum/*.py` 现算），读到这儿你大概已经能猜到它长什么样——**真正起作用的是下面这五条契约**：
 它们写死在 `CONTRACT.md` 里，也写死在模板里。
 
 | 契约 | 约束什么 |
 |---|---|
 | **配置** | 一个 `review.yaml` 描述「审什么、谁来审、门禁多严」。**引擎里不出现任何具体项目的信息** |
 | **工单** | 自包含、**按「声明」而不是「文件」组织**、必须留一节让审核员反驳作者的方法学结论 |
+| **通道** | 通道声明的端点必须被**事实侧**核对过（`preflight` 的阳性 + 阴性对照）。**声明不算数** |
 | **输出** | 严重度表（每条带「我怎么查出来的」）+ 最脆弱一环 + 附录「推翻了什么」 |
 | **处置** | 台账每行可挂一条 `check` 断言；`verify` 跑它 |
 
@@ -175,22 +245,37 @@ quorum check-leaks .
 - **只走 CLI，不提供 import API。** 需要编程接入就消费 `quorum plate --json`（稳定的输出契约），
   这样上层不必跟版本绑定，非 Python 项目也能用。也不做 MCP——那只是给 CLI 套一层生命周期。
 - **审核员只读、结论由 runner 落盘。** 结论由 runner 写，审核员进程不碰材料。
-  注意：`codex-cli` 能在 CLI 层**强制**只读（`-s read-only`），`claude-cli` 不能——
-  后者只能靠工单措辞 + **事后材料快照比对**兜底。`run` 会把只读强度打印出来并记进结论头部，
+  注意：`codex-cli` 能在 CLI 层**强制**只读（`-s read-only`），`claude-cli` / `opencode-cli` 不能——
+  后两者只能靠工单措辞 + **事后材料快照比对**兜底。`run` 会把只读强度打印出来并记进结论头部，
   不让「审核员只读」变成一个没人验证的假设。
+- **「声明」必须配一条事实侧的对照。** 通道报的 `vendor` 工具验不了，这是事实；
+  但**验不了不等于不去验能验的那部分**。`preflight` 用一条故意错的凭据反证
+  「请求确实经过了它声明的端点」——这是唯一一种事后看不出来的失败，所以值得为它多花两次请求。
 - **内容优先于退出码。** 退出码描述的是进程，不是材料。完整结论不该因为收尾信号被作废。
 - **材料快照指纹进结论头部。** 「这份结论审的是哪一版」必须能被回答；各家快照不一致时 `plate` 直接报警。
 - **结论先写临时文件、四门全过再原子落位**，已有非空结论先留档——损坏一份已有结论比不产出更糟。
 
 ## 这个仓库自己就是一次用例
 
-quorum 被它自己审过三轮 —— 三个真通道（kimi / qwen / codex），40+ 条发现，逐条处置。
+quorum 被它自己审过三轮 —— 40+ 条发现，逐条处置。
 这不是营销话术，材料和台账都在仓库里：
+
+> ⚠️ **但那三轮的「三个通道」是假的（2026-10-02 更正）。**
+> 配置里写着 kimi / qwen / codex 三个来源，**实际三条全部由同一个模型服务**：
+> 两个 `claude-cli` 通道声明的 `ANTHROPIC_*` 环境变量从未生效（进程环境变量被 CLI 自己的
+> 用户级 settings 盖过），请求被送进本机代理，由它按自己的 provider 路由。
+> codex 那条没有被劫持，**所以真实的形状是「1 个 vendor × 2 个 harness」**，不是三个独立来源。
+>
+> **发现本身保留**——它们是关于代码的，逐条对着源码核过，作废的只是**置信度**那一列。
+> 原委与证据见 [`reviews/CORRECTIONS.md`](reviews/CORRECTIONS.md)。
+>
+> 这件事直接催生了 `quorum preflight`：工具现在会在起审核员之前，
+> 用一条**故意错的凭据**反证「请求真的经过了配置里声明的那个端点」。
 
 | 位置 | 是什么 |
 |---|---|
 | `reviews/brief.md` | 自审工单（按「声明」组织，不是按文件） |
-| `reviews/review.yaml` | 真通道配置（三个不同模型族） |
+| `reviews/review.yaml` | 通道配置（**原始的「三个模型族」标注已作废**，见上） |
 | `reviews/rounds/` | 三轮的原始结论 + 交叉表（含一件缺件的如实说明） |
 | `reviews/dispose.md` | 处置台账，**24 条带可执行断言** |
 

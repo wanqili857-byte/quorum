@@ -1,64 +1,45 @@
-# quorum · 自审处置台账
+# quorum · 自审处置台账 · 第 4 轮
 
-> 三轮自审（kimi / qwen / codex，真通道）共提出 40+ 条。这里列的是**有断言的那部分**。
+> 填法：`处置` 写改了什么；`check` 填一条**能失败的**命令（退出 0 才算修好）；
+> `status` 填 ⬜/✅/❌。`quorum verify` 会跑所有 check，把 ✅ 变成可证伪的断言。
+
+> ## ⚠️ 这一轮的保留：两家审的**不是同一份材料**
 >
-> 每条 `check` 的标准：**把这个修复回滚，它会不会红？** 不会红的不写进来。
-> `quorum verify --config reviews/review.yaml` 会全部跑一遍。
+> `plate` 自己报了：kimi `git:ce4379cd2372` / luna `git:737e03c20b6d`。
+> 差别是我在 kimi 跑完之后改的仓库（opencode 权限修复、`demo/out` 排除、文档）。
+> 所以那 5 条「跨模型族一致」要注意依据：它们指向的 `leaks.py` / `preflight.py` /
+> `tests/` **都没被那次改动碰过**，一致成立；但这个台账是**两轮合并**的产物，
+> 不是一次干净的对照。
+
+> ## 关于「置信度」这一列
 >
-> 这份台账本身就是对第三轮那条批评（「作者自己的台账零条断言，verify 恒绿」）的处置。
+> 与前三轮**不同**：这一轮的两轴是**真的**跨开了（moonshot/OpenAI × claude-cli/opencode-cli，
+> 两个端点、两套生态）。所以 `跨模型族一致` 这一次不是标签游戏——它背后是两个互不相干的进程。
+> 但仍受上面那条保留限制。
 
 | # | 置信度 | 严重度 | 位置 | 问题 | 处置 | check | status |
 |---|---|---|---|---|---|---|---|
-| 1 | 跨模型族一致 | 🔴 | `cli.py` dispose | `plate --dispose` 裸 `open(path,"w")`，会原地截断用户填好的台账 | 改为 `protect_existing` + `atomic_write` | `pytest -q tests/test_quorum.py::test_dispose_protects_existing_ledger` | ✅ |
-| 2 | 跨模型族一致 | 🔴 | `plate.py` | CONTRACT 说 cross 不计入「跨模型族一致」，代码里 `role` 从未被读 | `Cluster.primary_families` 只看 primary | `pytest -q tests/test_quorum.py::test_plate_ignores_cross_role_for_confidence` | ✅ |
-| 3 | 跨模型族一致 | 🔴 | `config.py` | `family` 缺省 `"unknown"` 被 COI 校验豁免 → 三个 primary 不写 family 即可全过 | 缺 family 直接报错 | `pytest -q tests/test_quorum.py::test_config_requires_explicit_vendor` | ✅ |
-| 4 | 跨模型族一致 | 🔴 | `leaks.py` | 只扫 `git ls-files` 跟踪文件 → 未跟踪但即将提交的 `.env` 不扫 | 加 `--others --exclude-standard` | `grep -q -- '--others' quorum/leaks.py` | ✅ |
-| 5 | 跨模型族一致 | 🔴 | `ledger.py` | 台账用裸 `split("\|")`，与发现表两个切分器 | 复用 `gates._split_row` | `grep -q '_split_row' quorum/ledger.py` | ✅ |
-| 6 | 跨模型族一致 | 🔴 | `gates.py` | 门禁数 emoji 出现次数而不是发现条数 | 数解析出的发现行，且要求 problem ≥ 8 字 | `pytest -q tests/test_quorum.py::test_gate_counts_findings_not_emoji_spam` | ✅ |
-| 7 | 跨模型族一致 | 🟡 | `gates.py` | 表头「严重度」必须落第 0 列；数据行提到这三个字会被误判成表头 | 按列名映射 + 收紧表头判定 | `pytest -q tests/test_quorum.py::test_severity_column_need_not_be_first` | ✅ |
-| 8 | 跨模型族一致 | 🟡 | `snapshot.py` | >8MB 文件只按 (size, mtime) → 同长度同 mtime 的替换隐形 | 首尾各 64KB 取样哈希 | `grep -q '_sample_hash' quorum/snapshot.py` | ✅ |
-| 9 | 跨模型族一致 | 🟡 | `snapshot.py` | `snapshot_exclude` 裸 `startswith`、不支持 glob、根目录层永不匹配 | `_excluded()` 统一判定 + fnmatch | `grep -q 'fnmatch' quorum/snapshot.py` | ✅ |
-| 10 | 跨模型族一致 | 🟢 | `cli.py` | `tempfile.mktemp()` 已废弃且产生竞态与孤儿文件 | 换 `mkstemp` | `! grep -q 'mktemp(' quorum/cli.py` | ✅ |
-| 11 | 含交叉 · 中置信 | 🔴 | `cli.py` `leaks` | `--self-test` 的过滤条件恰好滤掉了它要抓的失败 | 去掉字符串过滤 | `pytest -q tests/test_quorum.py::test_cli_self_test_can_actually_fail` | ✅ |
-| 12 | 含交叉 · 中置信 | 🔴 | `tests/` | 两条**不可能失败**的断言（断言不存在的文件、断言 runner 总会写的串） | 改成真能失败 | `pytest -q tests/test_quorum.py::test_e2e_material_change_is_flagged tests/test_quorum.py::test_env_file_indirection_keeps_secret_out_of_config` | ✅ |
-| 13 | 含交叉 · 中置信 | 🔴 | `demo/` | demo 事故一的 41.0% 复现不出来 | 改为「覆盖率被当成准确率」，并加 `metrics.py` | `python3 demo/project/metrics.py \| grep -q '41.0%'` | ✅ |
-| 14 | 含交叉 · 中置信 | 🟡 | `plate.py` | `--json` 丢掉了 `disagreement` 与 `primary_families` | 补进输出契约 | `grep -q '"disagreement"' quorum/plate.py` | ✅ |
-| 15 | 含交叉 · 中置信 | 🟡 | `plate.py` | `disagreement` 阈值 0.20 落在「同一条发现」的相似度区间内 → 信号无效 | 提到 0.30 并写明标定依据 | `grep -q '平均相似度 %.2f < 0.30' quorum/plate.py` | ✅ |
-| 16 | 含交叉 · 中置信 | 🟡 | `plate.py` | `match_reason` 用了内层循环泄漏出来的 `same_file` | 显式记录 `best_same_file` | `grep -q 'best_same_file' quorum/plate.py` | ✅ |
-| 17 | 单家独有 | 🟢 | `demo/ledger_example.md` | 示例台账里的 check 是**装饰性**的（掏空正文照样通过） | 换成判别性断言，并写清工具抓不到这一类 | `pytest -q tests/test_quorum.py::test_demo_ledger_reports_the_expected_verdicts` | ✅ |
-| 18 | 单家独有 | 🟢 | `README.md` `CONTRACT.md` | 代码体量的说法互不一致，且写死了会漂的数字 | 改成不写死 | `! grep -qE '两百来行\|引擎约 [0-9]+ 行' README.md CONTRACT.md` | ✅ |
-| 19 | 单家独有 | 🟡 | `cli.py` `gates.py` | 「审核员卡住了」与「交了个差结论」在门禁看来一样 | 加 blocked 识别与针对性提示 | `grep -q 'BLOCKED_MARKERS' quorum/gates.py` | ✅ |
-| 20 | 单家独有（Kimi 轮 3） | 🔴 | `demo/review.yaml` + `config.py` | **COI 校验的是标签，不是来源**：三个审核员同通道、同脚本，只有 `family` 字符串不同，却能产出「跨模型族一致 · 高置信」。**审核员还给了具体建议**：同一 `channel` + 同一 `model` 的多个 primary 给显眼告警，或让 `family` 与 `model` 建映射 | **本条当时被我降级了**——以「无法自动识别」为由，只做了「通道名记进结论头部」。**那个理由不成立**：`channel.kind` 是可读的，harness 能推出来。真正修掉它的是第 22 行（拆两轴 + 同 harness 注记），审核员当年建议的正是这件事的一半。此处如实改注，不再把缓解当修复 | `pytest -q tests/test_quorum.py::test_plate_annotates_shared_harness` | ✅（由 #22 真正修掉） |
-| 21 | 真实使用发现 | 🟡 | `leaks.py` `cli.py` | 启发式规则 `~/<任意词>/` 把 `~/workspace/` 等正当占位符判成泄漏 → 假警报淹没真警报 | 规则分 `fail`/`warn` 两档，退出码只看 fail；README 写明「rc=0 ≠ 干净」 | `pytest -q tests/test_quorum.py::test_leak_scan_finds_username_and_secrets` | ✅ |
-| 22 | 用户复核发现 | 🔴 | `config.py` `plate.py` | 两个独立的来源轴（模型 vendor / agent harness）被压成一个 `family` 字段；两家 vendor 同走一个 harness 时打出「跨模型族一致」而读者以为买到两维独立 | 拆成两轴：`vendor`（声明）+ `harness`（事实，从通道推出）；`plate` 两轴都报，同 harness 加注记不降级 | `pytest -q tests/test_quorum.py::test_plate_annotates_shared_harness tests/test_quorum.py::test_plate_annotates_same_vendor_two_harnesses tests/test_quorum.py::test_plate_reports_full_independence_when_both_axes_span` | ✅ |
-| 23 | 用户复核发现 | 🔴 | `channels.py` | `kind` 是封闭枚举（claude-cli / codex-cli / fake）→ 想接别的 CLI 必须改库源码，「harness 可自定义」是空话 | 新增通用 `kind: exec`（argv + `{prompt}`/`{repo}`/`{out}` 占位符） | `pytest -q tests/test_quorum.py::test_exec_channel_lets_you_plug_in_any_cli` | ✅ |
-| 24 | 用户复核发现 | 🟡 | `templates/review.yaml` | 模板里写死真实厂商名与真实端点，且用着过期的门禁键名 `min_severity_marks` | 模板改占位符；例子挪进 `examples/` 并标注「这是例子，不是全部选项」 | `! grep -qE 'moonshot\|dashscope\|kimi-k2\|min_severity_marks' templates/review.yaml` | ✅ |
-
-## 写这份台账时自己踩的坑（留档）
-
-第一版里有三条 `check` 写成了「**文件里不该出现某个字符串**」：
-
-```
-! grep -q '"unknown"' quorum/config.py
-! grep -q '"样本" not in f' quorum/cli.py
-! grep -q 'grep -q METRICS' demo/ledger_example.md
-```
-
-跑 `verify` 时三条全红。但它们不是「修复失效」，而是**断言写错了**——
-那三个字符串分别躺在 `Reviewer` 的默认值、**我解释这个修复的注释**、
-以及 demo 台账里**说明这是反面例子**的段落里。
-
-这跟台账要防的「装饰性断言」是同一族毛病：**测的不是那件事**。
-现在三条都换成行为断言（真的构造出场景，看它会不会失败）。
-
-## 没写进本表的部分
-
-三轮合计 40+ 条里，有些是**已确认但选择不修**、或**无法用断言表达**的：
-
-| 项 | 为什么不修 |
-|---|---|
-| `claude-cli` 无法在 CLI 层强制只读 | 上游 CLI 没有沙箱开关。已改为：运行时打印只读强度 + 写进结论头部 + 事后材料快照比对兜底 |
-| `vendor` 无法验证真伪 | 这是**声明字段**，工具无法知道两个通道背后是不是同一个模型。已写进 CONTRACT（两个轴都记进结论头部供人事后核对） |
-| `harness` 覆盖可能被滥用 | 覆盖是必需的（`exec` 接两个不同 CLI 不覆盖会塌成一个），但它同时让人能给同一个 loop 改个名字、把「同 harness」注记消掉。工具分不出「真换了 loop」和「只改了标签」。已写进 CONTRACT 与模板，靠人守 |
-| 装饰性断言无法自动识别 | 判它需要知道「修复前的状态」。写在 CONTRACT 里，靠人守 |
-| 审核员沙箱能力差异 | 不同会话的权限不同（同一家的 qwen 两次跑，一次能跑 python 一次不能）。已加 blocked 识别，但无法预防 |
+| 1 | 跨模型族一致 · 高置信（两轴皆跨：2 vendor × 2 harness） | 🔴 | `quorum/leaks.py:134-138` + `leaks.py:23` | **两种静默跳过导致真实密钥漏检**：`git ls-files --exclude-standard` 会跳过被 `.gitignore` 的 `.env`；`>4MB` 文件直接跳过且不报告 | **修（部分）** 两种静默跳过拆开看：① **超大/非文本文件跳过不报**——那是真洞，`scan()` 把它们记进局部变量就从没写回 `hits['__skipped__']`（见 #6），已修。② **`.gitignore` 的 `.env` 不扫**——**不修，这是设计**：`tracked_files` 用 `--cached --others --exclude-standard`，而本门禁的职责是「**会被发布出去的东西**里有没有泄漏」，gitignore 的文件发布不出去；若被 `git add -f` 强加，`--cached` 就会带上它。kimi 这条越界了。 | `python3 -m pytest -q tests/test_quorum.py::test_skipped_files_are_reported_not_swallowed` | ✅ |
+| 2 | 跨模型族一致 · 高置信（两轴皆跨：2 vendor × 2 harness） | 🔴 | `quorum/preflight.py:217-225` + `:243-247` | **预检桶对时间不稳定**：被劫持通道只要比 timeout 慢就落进 `channel_down`（不拦人）；阴性对照若超时（如真实 claude-cli 对坏凭据挂住）则落进 `verified` | **修** 阴性对照**没返回**时不再写成「端点确实校验了这一路凭据」，拆出独立的 `not_refuted` 档：它确实排除了「凭据没生效」，但「被拒」与「挂住」分不开，所以**端点是否校验凭据没有被证明**。kimi 说的另一半（劫持通道回话慢会落进 `channel_down`）是同一处的另一面：超时上限由阳性基线推出来，基线本身就慢时确实会更宽——那条保持不拦人，但报告会点名说没验过。 | `python3 -m pytest -q tests/test_quorum.py::test_preflight_does_not_paint_a_hang_as_verified` | ✅ |
+| 3 | 跨模型族一致 · 高置信（两轴皆跨：2 vendor × 2 harness） | 🔴 | `quorum/leaks.py:116-122` | **fixture 自跳过可被滥用**：任何名为 `leaks.py` 且含公开 marker 字符串的文件都会被整个跳过 | **出列** 触发它需要「知道 `FIXTURE_MARKER` 这个常量、并故意把文件取名 `leaks.py` 抄进去」——那是对抗场景，而这个门禁防的是**误泄漏**，不是刻意规避。仍然收紧了一点：判据从「文件名 + 标记」加到「文件名 + 标记 + 含 `def default_patterns(`」，把「顺手把自己的扫描脚本取名 leaks.py」这种**无意**误跳过挡住。 |  | ⬜ |
+| 4 | 跨模型族一致 · 高置信（两轴皆跨：2 vendor × 2 harness） | 🔴 | `tests/test_quorum.py:418-420` | `test_leak_self_test_proves_patterns_can_fail` 同样只断言通过，未证明「能失败」 | **修** 补阴性对照：种一条抓不到自己样本的规则，自检必须报出来。原来只断言 `== []`，那是「这次没发现问题」，不是「这条检查能失败」。 | `python3 -m pytest -q tests/test_quorum.py::test_leak_self_test_proves_patterns_can_fail` | ✅ |
+| 5 | 跨模型族一致 · 高置信（两轴皆跨：2 vendor × 2 harness） | 🟡 | `tests/test_quorum.py:113` | literally 永真断言：`assert main.__module__ and True`，与测试宣称的「不能失败的检查是装饰」相矛盾 | **修** 删掉 `assert main.__module__ and True`（非空字符串恒为真）。讽刺的是它长在一个专讲「修饰性断言」的测试里。 | `! grep -qE '^ *assert main\.__module__' tests/test_quorum.py` | ✅ |
+| 6 | 单家独有 · 待复验 | 🔴 | `quorum/leaks.py:153,168,173,190` | **跳过文件报告是死代码**：`scan()` 把二进制/超大/非 UTF-8 文件追加到局部变量 `skipped`，但返回前**从未写入 `hits["__skipped__"]`**，导致 | **修** `scan()` 返回前补上 `hits['__skipped__'] = skipped`。跳过文件从此会被报出来——**「没扫到」和「没命中」在输出里必须长得不一样**。 | `python3 -m pytest -q tests/test_quorum.py::test_skipped_files_are_reported_not_swallowed` | ✅ |
+| 7 | 单家独有 · 待复验 | 🔴 | `quorum/leaks.py:221-226` | **`render()` 死分支覆盖「未发现」消息**：`out = ["在 %s 下发现：", ""]` 被错误地缩进到 `if/else` 之外，导致「未发现任何命中」被覆盖；干净扫描输出一句「在 | **修** `render()` 里那个 `out = [...]` 移进 `else` 分支。此前它无条件覆盖「未发现任何命中」，干净目录会打成「在…下发现：」后面空着——**读起来像有发现**。 | `python3 -m pytest -q tests/test_quorum.py::test_clean_scan_says_clean_not_found` | ✅ |
+| 8 | 单家独有 · 待复验 | 🔴 | `quorum/gates.py:56-74` | 门禁绿灯可由形式空洞的产出获得，检查的是“行数和长度”，不是读者以为的“发现有证据、可复核”。位置、证据可以为空，问题栏只需达到最短长度。 | **修** 门禁开始校验**「位置」与「证据」列非空**。旧版只量「问题」列长度，于是 `／ 🔴 ／  ／ 这一行的问题描述凑够八个字 ／  ／` 是一张**能过门禁的空表**。⚠️ 但只在**那一列被认出来时**才要求：列名认不出时整列为空，那种情形下丢发现是错的（缺的是信息，不是结论）——`test_row_alias` 那条回归守的就是这个区分。 | `python3 -m pytest -q tests/test_quorum.py::test_hollow_findings_do_not_pass_the_gate` | ✅ |
+| 9 | 单家独有 · 待复验 | 🔴 | `quorum/snapshot.py:115-160` | glob 命中目录时只保留文件，不遍历目录；此外大文件中段变化不会反映到摘要。指定 `sources` 的路径形式稍有变化，就可能静默漏掉材料。 | **修** `sources` 里的 glob 命中**目录**时走进去。旧版 `if os.path.isfile(p)` 把目录整个丢掉，于是 `sources: ['src/*']` 会静默漏掉所有子目录——**「没扫到」和「没变化」在指纹上长得一样**，而那正是快照存在的理由。 | `python3 -m pytest -q tests/test_quorum.py::test_snapshot_glob_walks_into_matched_directories` | ✅ |
+| 10 | 单家独有 · 待复验 | 🔴 | `quorum/gates.py:66-74` | 任意短语可充当发现，只要足够长并填满条数；完全没有可核实证据仍能绿。 | **修** 同 #8：门禁不再接受「位置与证据都空着」的行。 | `python3 -m pytest -q tests/test_quorum.py::test_hollow_findings_do_not_pass_the_gate` | ✅ |
+| 11 | 单家独有 · 待复验 | 🔴 | `quorum/preflight.py:235-247` | 挂住的错误凭据会被报告为“端点确实校验了凭据”，正好把不确定状态绿化。 | **修** 同 #2。挂住的阴性对照不再落进 `verified`，改判 `not_refuted`，并且**结论句里不再出现「端点确实校验了这一路凭据」**。 | `python3 -m pytest -q tests/test_quorum.py::test_preflight_does_not_paint_a_hang_as_verified` | ✅ |
+| 12 | 单家独有 · 待复验 | 🟡 | `quorum/cli.py:274` | `cmd_leaks` 静默吞掉 `ConfigError`，自定义 `leak_patterns` 若配置解析失败会被丢弃且不报警 | **修** `cmd_leaks` 不再 `except ConfigError: pass`，改为打 stderr。配置写坏时自定义规则会被静默丢弃——**少守几条和全守住，输出长得一样**。 | `grep -q '自定义泄漏规则' quorum/cli.py` | ✅ |
+| 13 | 单家独有 · 待复验 | 🟡 | `tests/test_quorum.py:218` | 断言由测试自己的写入保证为真：`assert "SECRET-VALUE" not in cfg_p.read_text()`，未真正测试 `channels.build` 是否把密钥隔离出配置 | **修** 改成断言**命令行里没有密钥**（`ps` 和 shell 历史是真正会外泄的那一处）。原来断言的是「测试自己刚写下去的那份配置里没有密钥」——同义反复。 | `grep -q '密钥进了命令行' tests/test_quorum.py` | ✅ |
+| 14 | 单家独有 · 待复验 | 🟡 | `tests/test_quorum.py:871-874` | `test_preflight_self_test_can_actually_fail` 名不副实：docstring 说「必须能红」，body 却 `assert self_test() == 0` | **修** 补阴性对照：把自检用的桩换坏，`self_test()` 必须返回 1。原来只断言 `== 0`，那是「全绿」不是「能红」。 | `python3 -m pytest -q tests/test_quorum.py::test_preflight_self_test_can_actually_fail` | ✅ |
+| 15 | 单家独有 · 待复验 | 🟡 | `tests/test_quorum.py:392-398` | `test_plate_snapshot_cannot_be_spoofed_by_body_text` 测试的是本地重写的正则副本，未覆盖生产代码的 fallback 正则 `材料快照：...` | **修** 抽出 `plate.snapshot_of()`，生产代码与测试调同一个函数。原来测试**抄了一遍正则**，而且只抄了第一条（机器标记），**回退那条（`材料快照：`）从来没被测过**——回退恰好是审核员能伪造的那一半。 | `python3 -m pytest -q tests/test_quorum.py::test_plate_snapshot_cannot_be_spoofed_by_body_text` | ✅ |
+| 16 | 单家独有 · 待复验 | 🟡 | `quorum/plate.py:208-242` | 贪心聚类允许桥接：新行只需与簇中任一行相似，不要求与整簇相容。不同问题可形成“链式共识”，标签却按整簇 primary vendor 生成。 | **修** 加**桥接剪枝**：每个成员必须与簇的**种子**相连，连不上的拆出去自成新簇。贪心合并只要求「与簇里任意一条像」，于是 A~B、B~C 而 A≁C 时三条会落进同一簇，标签照样打「跨模型族一致」——**这与本函数开头的承诺「宁可拆细，不要合错」直接冲突**。N=2 时不可能触发，是为 N≥3 准备的。 | `python3 -m pytest -q tests/test_quorum.py::test_cluster_prunes_bridges` | ✅ |
+| 17 | 单家独有 · 待复验 | 🟡 | `quorum/plate.py:181-183,307-325,329-340` | “逐条列原话”只在完整 Markdown 明细中成立。JSON 只保留首条 `problem` 和各来源的 `evidence`，不保留每个来源各自的 `problem`；dispose 台账骨架也只 | **修** JSON 的每条 source 补上**它自己那句 problem**。旧版只有 `{reviewer, evidence}`，而 clause 级的 problem 用的是某一家的那一句——于是 `render()` 在 Markdown 里承诺的「每家原话都列出来」，**在 JSON 这条输出通路上不成立**。 | `python3 -m pytest -q tests/test_quorum.py::test_json_keeps_each_reviewers_own_problem` | ✅ |
+| 18 | 单家独有 · 待复验 | 🟡 | `quorum/channels.py:64-82` | opencode 权限检查只要求存在 `permission`，不校验权限内容是否足以避免宽权限；存在字段不等于限制已生效。 | **修** 权限检查从「`permission` 这个键在不在」改成**核对内容**：兜底 `*` 必须 deny、`external_directory` 必须 deny、`edit` 必须 deny，少一条拒绝启动。旧检查放行了 `'allow'`（全放行）、`{}`（回落默认＝照样卡死）、`{external_directory: allow}`（允许读到工作目录之外）——**「存在字段 ≠ 限制生效」，那道守卫本身就是装饰性的**。 | `python3 -m pytest -q tests/test_quorum.py::test_permission_check_rejects_wide_values_not_just_missing_field` | ✅ |
+| 19 | 单家独有 · 待复验 | 🟡 | `quorum/gates.py:139-178`、 | “已有非空结论先留档”在正常单路可复验，但秒级备份名与固定 `.tmp` 在同名 reviewer 并发或同秒重复运行时存在碰撞风险，可能覆盖备份或竞争同一临时文件。 | **修** 留档名撞了就往后再找一个空的（绝不覆盖）；`atomic_write` 的临时名带上 pid 与进程内序号。旧版同一秒内第二次留档会**静默覆盖**第一份——**防丢东西的那一步自己有个会丢东西的窗口**。 | `python3 -m pytest -q tests/test_quorum.py::test_backup_never_clobbers_an_existing_backup` | ✅ |
+| 20 | 单家独有 · 待复验 | 🟡 | `quorum/cli.py:122-145,320-322` | `--dry-run` 跳过 preflight 是合理的，但随后仍调用 `channels.build()`，会解析 `_FILE` 并读密钥文件；与帮助中的“不需要密钥”不完全相符。 | **修（口径）** `--dry-run` 的帮助改成实话：它确实不发起任何请求，但**仍会解析 `_FILE`**，密钥文件必须存在。实现不改——把检查留在那里更符合本项目的取向（宁可要求凭据在位，也不要让一条路径悄悄少做检查）。 | `grep -q '仍会解析' quorum/cli.py` | ✅ |
+| 21 | 单家独有 · 待复验 | 🟡 | `demo/project/make.py:49-54,88-101`、 | demo 的第二个事故演示了“生成的报告缺正文”这一结果，但没有复现所述回填脚本截断正文、再由只校验数字块的门禁放行的执行链。当前 `gate.py` 检查的是预测 ID 子集，不读取报告。 | **修** 补 `demo/project/metric_gate.py`（事故二里那个「绿」），并接进 `run_demo.sh`。此前 `demo/README.md` 一直在解释「事故二的门禁为什么绿」，**而 demo 里根本没有那道门禁**——只有事故一的 `gate.py`。那句话是散文，读者验证不了。新门禁是真门禁：区块数字改坏它会红。 | `python3 -m pytest -q tests/test_quorum.py::test_demo_gates_are_green_on_broken_material_but_can_go_red` | ✅ |
+| 22 | 单家独有 · 待复验 | 🟡 | `quorum/ledger.py:169-175` | 默认 verify 对全无断言台账返回 `0`；使用者只看退出码会误读成已验证。 | **出列** **设计如此，且已明说**：`exit_code` 的 docstring 写着「默认只在『台账说谎』时非零，`--strict` 把『无断言』也算失败」，`render()` 在一条断言都没有时会打一行加粗告警，README 也写了「rc=0 只意味着没有 fail 档命中，必须读输出正文」。**只看退出码不看正文**是被明确警告过的用法，不是被隐瞒的性质。 |  | ⬜ |
+| 23 | 单家独有 · 待复验 | 🟡 | `quorum/plate.py:208-242`、 | 启发式桥接可把彼此几乎不相似的发现放进“高置信”簇；标签计的是配置 vendor 数，不是结论相同或来源独立。 | **修** 同 #16：桥接剪枝。 | `python3 -m pytest -q tests/test_quorum.py::test_cluster_prunes_bridges` | ✅ |
+| 24 | 单家独有 · 待复验 | 🟡 | `quorum/snapshot.py:115-160` | 指纹绿不证明未选入 `sources` 的材料没变，也不证明大文件未被中段替换。 | **部分出列** ① glob 那半已修（同 #9）。② **大文件中段变化不可见是已文档化的取舍**：`_sample_hash` 取首尾各 64KB，代码与注释都写明了代价（`MAX_HASH_BYTES`）。③ 「指纹绿不证明未选入 `sources` 的材料没变」——**这是定义，不是缺陷**：快照的语义就是「`sources` 覆盖的那部分没变」。 |  | ⬜ |

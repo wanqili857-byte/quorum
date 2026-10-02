@@ -190,19 +190,27 @@ def collect(cfg: Config) -> Tuple[List[Row], Dict[str, str]]:
         text = read_text(p)
         if not text:
             continue
-        # 只认 runner 写在头部的**机器可读标记**。旧版用 `材料快照：\`([^\`]+)\`` 全篇扫描、
-        # 后者覆盖前者 —— 审核员只要在正文里写一行同格式文本，就能把真快照盖掉、
-        # 从而**关掉 plate 的快照不一致告警**。
-        m = re.search(r"<!--\s*quorum:snapshot\s+(\S+)\s*-->", text)
-        if not m:
-            m = re.search(r"材料快照：`([^`]+)`", text.split("\n---\n")[0])
-        if m:
-            snaps[r.name] = m.group(1)
-        else:
-            snaps[r.name] = "（该结论无快照标记）"
+        snaps[r.name] = snapshot_of(text)
         for sev, loc, prob, ev in split_table_rows(text):
             rows.append(Row(r.name, r.vendor, r.harness, sev, loc, prob, ev, r.role))
     return rows, snaps
+
+
+def snapshot_of(text: str) -> str:
+    """从一份结论里取出材料快照标记。取不到就返回一句说明，**不返回空串**。
+
+    为什么要抽成函数（2026-10-02，luna 独立发现）：测试原本**把这两条正则抄了一遍**再断言。
+    抄本的问题不是「会漂」这么抽象——是它**只抄了第一条**（机器可读标记），
+    第二条（`材料快照：\\`…\\`` 回退）从来没被测过，而回退恰好是审核员能伪造的那一半。
+    **测的必须是那个东西，不是它的抄本。**（这是本项目的老教训，这次在自己仓库里又犯了一遍。）
+    """
+    # 只认 runner 写在头部的**机器可读标记**。旧版用 `材料快照：\`([^\`]+)\`` 全篇扫描、
+    # 后者覆盖前者 —— 审核员只要在正文里写一行同格式文本，就能把真快照盖掉、
+    # 从而**关掉 plate 的快照不一致告警**。
+    m = re.search(r"<!--\s*quorum:snapshot\s+(\S+)\s*-->", text)
+    if not m:
+        m = re.search(r"材料快照：`([^`]+)`", text.split("\n---\n")[0])
+    return m.group(1) if m else "（该结论无快照标记）"
 
 
 def cluster(rows: List[Row], thr_same_file: float = 0.07, thr_text: float = 0.10) -> List[Cluster]:
@@ -236,6 +244,37 @@ def cluster(rows: List[Row], thr_same_file: float = 0.07, thr_text: float = 0.10
             c = Cluster([row])
             c.members = [idx]
             clusters.append(c)
+    # ---- 桥接剪枝 ----------------------------------------------------------
+    #
+    # 上面的合并条件是「与簇里**任意一条**足够像」。于是 A~B、B~C 而 A≁C 时，
+    # 三条会落进同一簇 —— 一个**链式共识**，首尾两条其实没关系，
+    # 而标签照样按整簇的 primary vendor 生成「跨模型族一致 · 高置信」。
+    # （2026-10-02，luna 独立发现；kimi 在 #23 从另一端点到同一处。）
+    #
+    # 这跟本函数开头的承诺直接冲突：那里写的是「**宁可拆细，不要合错**」。
+    # 所以补一步：**每个成员必须与簇的种子相连**，连不上的拆出去自成新簇。
+    # N=2 时这一步永远不动（两家最多两条，构不成链）——它是为 N≥3 准备的。
+    pruned: List[Cluster] = []
+    for c in clusters:
+        if len(c.members) <= 2:
+            pruned.append(c)
+            continue
+        seed = c.members[0]
+        keep, spill = [seed], []
+        for m in c.members[1:]:
+            sf = bool(_paths(rows[seed].location) & _paths(rows[m].location))
+            sc = _weighted_jaccard(tokens[seed], tokens[m], weight)
+            (keep if ((sf and sc >= thr_same_file) or sc >= thr_text) else spill).append(m)
+        kc = Cluster([rows[i] for i in keep])
+        kc.members, kc.why = keep, c.why
+        pruned.append(kc)
+        for m in spill:
+            sc_ = Cluster([rows[m]])
+            sc_.members = [m]
+            sc_.why = "桥接剪枝：与簇的种子不够像（原本只是与簇内另一条相连）"
+            pruned.append(sc_)
+    clusters = pruned
+
     clusters.sort(key=lambda c: (-len(c.primary_vendors), -len(c.primary_harnesses),
                                  -len(c.reviewers),
                                  -max(r.sev_rank for r in c.rows)))
@@ -321,7 +360,14 @@ def to_json(clusters: List[Cluster], snaps: Dict[str, str]) -> str:
             "disagreement": c.disagreement,
             "primary_vendors": c.primary_vendors,
             "primary_harnesses": c.primary_harnesses,
-            "sources": [{"reviewer": r.reviewer, "evidence": r.evidence} for r in c.rows],
+            # ⚠️ 每一家**各自的 problem 也要带上**（2026-10-02，luna 独立发现）。
+            # 旧版这里只有 `{reviewer, evidence}`，而 clause 级的 `problem` 用的是
+            # `c.headline()`（某一家的那一句）——于是 `render()` 在 Markdown 里承诺的
+            # 「**每家原话都列出来**」，在 JSON 这条输出通路上**不成立**。
+            # 消费 JSON 的下游拿到的是一句话 + 几段证据，会把一簇当成一个结论，
+            # 而一簇的成立条件只是「相似度够」。
+            "sources": [{"reviewer": r.reviewer, "problem": r.problem,
+                         "evidence": r.evidence} for r in c.rows],
         } for i, c in enumerate(clusters, 1)],
     }, ensure_ascii=False, indent=2)
 

@@ -118,7 +118,21 @@ def _tree(cfg: Config) -> Snapshot:
     for pat in roots:
         full = os.path.join(cfg.repo, pat)
         if any(ch in pat for ch in "*?["):
-            paths += [p for p in glob.glob(full, recursive=True) if os.path.isfile(p)]
+            # ⚠️ 命中目录时必须**走进去**（2026-10-02，luna 独立发现）。
+            # 旧版是 `paths += [p for p in glob.glob(full, recursive=True) if os.path.isfile(p)]`
+            # —— 目录被 `isfile` 过滤掉、**整个丢掉**。于是 `sources: ["src/*"]`
+            # 这种写法会静默漏掉所有子目录里的材料，而指纹照样是绿的：
+            # **「没扫到」和「没变化」在指纹上长得一模一样**，这正是快照机制存在的理由。
+            for p in glob.glob(full, recursive=True):
+                if os.path.isfile(p):
+                    paths.append(p)
+                elif os.path.isdir(p):
+                    for dp, dns, fns in os.walk(p):
+                        rel_dir = os.path.relpath(dp, cfg.repo)
+                        dns[:] = [d for d in dns
+                                  if not _excluded(os.path.join(rel_dir, d),
+                                                   cfg.snapshot_exclude)]
+                        paths += [os.path.join(dp, f) for f in fns]
         elif os.path.isfile(full):
             paths.append(full)
         elif os.path.isdir(full):

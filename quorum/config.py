@@ -65,7 +65,7 @@ class Channel:
     决定，工具不解释也不验证。
     """
     name: str
-    kind: str                      # claude-cli | codex-cli | exec | fake
+    kind: str                      # claude-cli | codex-cli | opencode-cli | exec | fake
     model: str = ""
     harness: str = ""              # 覆盖 harness 名；留空则取 kind
     env: Dict[str, str] = field(default_factory=dict)

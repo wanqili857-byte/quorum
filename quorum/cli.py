@@ -1,7 +1,8 @@
 """quorum 的命令行入口。
 
-四条命令，对应复核闭环的四段：
+五条命令，对应复核闭环的各段：
 
+    quorum preflight    阴性对照预检：通道声明的端点到底属不属实（**能拦人**）
     quorum run          起独立进程审核（干净上下文）→ 结论落盘 + 记账
     quorum plate        把几家的结论对齐成交叉表（一致 / 独有）→ 可导出处置骨架
     quorum verify       跑处置台账里每行的 `check` 断言 → 抓「台账说谎」
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Tuple
 
-from . import channels, gates, ledger, leaks, plate, snapshot
+from . import channels, gates, ledger, leaks, plate, preflight, snapshot
 from .config import ConfigError, load
 
 OK, FAIL = "✅", "✗"
@@ -111,8 +112,27 @@ def cmd_run(a) -> int:
         print("工单不存在：%s（配置里的 brief=%s）" % (cfg.brief_abs, cfg.brief), file=sys.stderr)
         return 2
 
-    snap = snapshot.take(cfg)
     jobs = len(want) if int(a.jobs) <= 0 else int(a.jobs)
+
+    # 起审核员**之前**先证明「这一路真的打到它声明的端点上」。
+    #
+    # 位置很关键：这是唯一一个能在**花掉一整轮**之前就发现「四条通道其实是同一个模型」
+    # 的地方。四轮复核全废在这件事上，而当时没有任何检查会响 —— 因为 `vendor` 被定义为
+    # 「声明」，工具不去核实。代价是每条通道多一次一 token 的请求。
+    # `--dry-run` 不发请求（它本来就跑在任何凭据解析之前）。
+    if not a.no_preflight and not a.dry_run:
+        _hdr("阴性对照预检")
+        verdicts = preflight.preflight(cfg, want, timeout_s=a.preflight_timeout, jobs=jobs)
+        print(preflight.render(verdicts))
+        if preflight.exit_code(verdicts):
+            print("\n预检未过——**一个审核进程都没起**。\n"
+                  "  这几条通道的凭据没有生效，说明配置里声明的端点不是实际在用的那个，\n"
+                  "  跑出来的结论会带上**错误的来源标签**（四轮复核就是这么废掉的）。\n"
+                  "  修好通道再跑；确定知道自己在干什么，用 --no-preflight 跳过。",
+                  file=sys.stderr)
+            return 2
+
+    snap = snapshot.take(cfg)
     print("项目 %s · 审核员 %s · 并发 %d" % (cfg.project, ", ".join(want), min(jobs, len(want))))
     print("工单：%s" % cfg.brief_for_prompt())
     print(snap.header_line().lstrip("> "))
@@ -186,6 +206,18 @@ def cmd_run(a) -> int:
     return rc_all
 
 
+# --------------------------------------------------------------- preflight
+def cmd_preflight(a) -> int:
+    cfg = load(a.config)
+    want = [r.name for r in cfg.reviewers] if a.all else [a.reviewer]
+    for n in want:
+        cfg.reviewer(n)
+    _hdr("阴性对照预检 · %s" % cfg.project)
+    verdicts = preflight.preflight(cfg, want, timeout_s=a.timeout, jobs=a.jobs)
+    print(preflight.render(verdicts))
+    return preflight.exit_code(verdicts)
+
+
 # ------------------------------------------------------------------- plate
 def cmd_plate(a) -> int:
     cfg = load(a.config)
@@ -239,8 +271,12 @@ def cmd_leaks(a) -> int:
             cfg = load(a.config)
             for name, rx in cfg.leak_patterns.items():
                 pats.append(leaks.Pattern(name, rx, a.self_sample or "sample", "来自配置"))
-        except ConfigError:
-            pass
+        except ConfigError as e:
+            # ⚠️ 这里曾经是 `pass`（2026-10-02，kimi 独立发现）。配置文件写坏时，
+            # 自定义的 leak_patterns 会被**静默丢弃**——扫描照跑、退出码照出，
+            # 而你以为那几条规则在守着。**少守几条和全守住，输出长得一样。**
+            print("⚠️ 配置 %s 没解析成功，自定义泄漏规则**一条都没生效**（用的是内置规则集）：%s"
+                  % (a.config, e), file=sys.stderr)
 
     if a.self_test:
         # 这里曾经写成 `[f for f in self_test(pats) if "样本" not in f]`，
@@ -284,8 +320,22 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--label", default="")
     r.add_argument("--jobs", type=int, default=0,
                    help="并发几个审核员（0 = 全部并发；1 = 串行，用于排查）")
-    r.add_argument("--dry-run", action="store_true", help="只打印将执行的命令（不需要密钥）")
+    r.add_argument("--dry-run", action="store_true",
+                   help="只打印将执行的命令与 env 的**键名**（不发起任何请求；"
+                        "但仍会解析 `_FILE`，所以密钥文件必须存在）")
+    r.add_argument("--no-preflight", action="store_true",
+                   help="跳过阴性对照预检（默认跑；跳过 = 放弃「端点属不属实」这条唯一的事实侧核对）")
+    r.add_argument("--preflight-timeout", type=int, default=120, help="每条通道预检的超时秒数")
     r.set_defaults(func=cmd_run)
+
+    f = sub.add_parser("preflight", help="阴性对照预检：通道声明的端点属不属实")
+    f.add_argument("--config", required=True)
+    gf = f.add_mutually_exclusive_group(required=True)
+    gf.add_argument("--reviewer")
+    gf.add_argument("--all", action="store_true")
+    f.add_argument("--timeout", type=int, default=120)
+    f.add_argument("--jobs", type=int, default=0)
+    f.set_defaults(func=cmd_preflight)
 
     t = sub.add_parser("plate", help="交叉表")
     t.add_argument("--config", required=True)

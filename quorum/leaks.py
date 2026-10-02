@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import codecs
 import getpass
 import os
 import re
@@ -24,6 +25,21 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 
 
 def _is_text(p: str) -> bool:
+    """是不是可扫的文本文件。
+
+    ⚠️ **4096 字节的切点会劈开多字节字符**（2026-10-02 修「跳过不上报」时炸出来的）。
+
+    旧版是 `chunk.decode("utf-8")` —— 只读前 4096 字节再整体解码。这个仓库**中文为主**，
+    一个汉字 3 字节，4096 几乎必然落在一个字的中间，于是 `UnicodeDecodeError` →
+    被判成「非文本」→ **整个文件跳过不扫**。
+
+    实测：`README.md` / `CONTRACT.md` / `quorum/snapshot.py` / `reviews/review.yaml`
+    全都被判成「非文本」。**这个公开仓的泄漏门禁一直在静默跳过它自己的大部分中文文件**，
+    而这件事在此之前完全不可见 —— 因为「跳过」那条路从来没上报过（见 `scan()` 末尾）。
+
+    改法：用**增量解码器**。`final=False` 时尾部不完整的那几个字节会被缓冲而不是报错 ——
+    切坏的是我们自己，不是文件。
+    """
     try:
         if os.path.getsize(p) > MAX_FILE_BYTES:
             return False
@@ -34,7 +50,7 @@ def _is_text(p: str) -> bool:
     if b"\x00" in chunk:
         return False
     try:
-        chunk.decode("utf-8")
+        codecs.getincrementaldecoder("utf-8")().decode(chunk)
         return True
     except UnicodeDecodeError:
         return False
@@ -78,7 +94,14 @@ def default_patterns(username: str = "") -> List[Pattern]:
                 "sk-abcdefghijklmnop", "API key / token / 私钥"),
         Pattern("邮箱", r"[\w.\-]+@[\w\-]+\.[A-Za-z]{2,}", "someone@example.com", "邮箱"),
         Pattern("手机号", r"(?<!\d)1[3-9]\d{9}(?!\d)", "13800138000", "中国大陆手机号"),
-        Pattern("IPv4", r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])", "10.20.30.40", "内网/公网 IP"),
+        # ⚠️ 环路地址必须排除。这条规则的名字是「内网/公网 IP」——它想抓的是**指明某个网络**的地址。
+        # `127.0.0.1` 是每台机器都有的环路地址，**零信息量**：它既不是内网也不是公网，
+        # 却出现在几乎每个本地服务、每条测试、每份示例配置里。
+        # 不排除的后果不是「多报几条」，是**把真警报淹掉**——`check-leaks` 会在
+        # 每个含本地 HTTP 服务端点的仓库上报红，然后所有人学会无视这个档位。
+        # （真实触发：`quorum/preflight.py` 的假端点与它的测试用了 `127.0.0.1`。）
+        Pattern("IPv4", r"(?<![\d.])(?!127\.)(?:\d{1,3}\.){3}\d{1,3}(?![\d.])",
+                "10.20.30.40", "内网/公网 IP（不含环路地址）"),
         Pattern("内部版本目录", r"\b\w+_v\d+_(?:out|output|result|dump)\b",
                 "experiment_v2_out", "看起来是内部产物目录名"),
     ]
@@ -109,10 +132,20 @@ FIXTURE_MARKER = "quorum-leaks-fixture-table-only-here"
 def _is_fixture_file(path: str, text: str) -> bool:
     """这个文件是不是「检测器自己的样例表」？
 
-    两个条件都要：文件名是 `leaks.py`，**且**内容里有 `FIXTURE_MARKER`。
-    只看文件名会误伤同名的第三方文件；只看标记则太宽。
+    三个条件都要：文件名是 `leaks.py`、内容里有 `FIXTURE_MARKER`、**且**内容里有它
+    对外暴露的函数名。只看文件名会误伤同名的第三方文件；只看标记则太宽。
+
+    ⚠️ 第三个条件是 2026-10-02 补的（kimi 独立发现）：`FIXTURE_MARKER` 是一个
+    **公开仓里的字符串常量**，所以「叫 `leaks.py` 且抄了那个常量」的任何文件都会被
+    整个跳过——包括一份真夹着密钥的。加上函数名之后，要跳过就得**整个文件长得像那个检测器**。
+
+    说清它不是防什么：能读源码的人当然能伪造。它挡的是**无意的**误跳过
+    （顺手把自己的扫描脚本取名 `leaks.py`），而那个才是这个门禁真正的对手——
+    它防的是误泄漏，不是刻意规避。
     """
-    return os.path.basename(path) == "leaks.py" and FIXTURE_MARKER in text
+    return (os.path.basename(path) == "leaks.py"
+            and FIXTURE_MARKER in text
+            and "def default_patterns(" in text)
 
 
 def tracked_files(root: str) -> List[str]:
@@ -180,6 +213,13 @@ def scan(root: str, patterns: List[Pattern], max_hits: int = 5,
                     hits.setdefault(pat.name, [])
                     if len(hits[pat.name]) < max_hits:
                         hits[pat.name].append((rel, i, m.group(0)[:60]))
+    # ⚠️ 这一行曾经**不存在**（2026-10-02 由 luna 那一路复核发现，kimi 也独立点到同一处）。
+    # 上面那些 `skipped.append(...)` 写的都是**局部变量**，而返回的是 `hits` ——
+    # 于是 `render()` 里那段「⚠️ 有 N 个文件跳过未扫」**永远打不出来**，
+    # `cmd_leaks` 的 `hits.pop("__skipped__", [])` 拿到的永远是空列表。
+    # 后果不是「少一条提示」，是**静默盲区**：一个 UTF-16 编码的 .env、一个 5MB 的日志，
+    # 会连同密钥一起被跳过，而输出干净得像没事。
+    hits["__skipped__"] = skipped
     return hits
 
 
@@ -212,16 +252,21 @@ def render(hits: Dict[str, List[Tuple[str, int, str]]], root: str,
            skipped: Optional[List[str]] = None,
            patterns: Optional[List[Pattern]] = None) -> str:
     real = {k: v for k, v in hits.items() if k != "__skipped__" and v}
+    # ⚠️ 这个 `out = [...]` 必须留在 `if/else` **里面或之后统一赋值**。
+    # 它曾经被写在 `if/else` 之外（忘了缩进）——于是无论有没有命中，
+    # 都无条件覆盖掉上面那句「未发现任何命中」，干净目录会打成：
+    #     在 /path 下发现：
+    # 后面空着。**读起来像有发现。**（2026-10-02 由 kimi 与 luna 各自独立实测到。）
     if not real:
         out = ["在 %s 下未发现任何命中。" % root]
     else:
         warn_names = {p.name for p in (patterns or []) if p.severity == "warn"}
-    out = ["在 %s 下发现：" % root, ""]
-    for name, items in sorted(real.items()):
-        tag = "（提示，不判定失败）" if name in warn_names else ""
-        out.append("- **%s**%s：%d 处（最多显示 5）" % (name, tag, len(items)))
-        for rel, ln, frag in items:
-            out.append("  - `%s:%d` → `%s`" % (rel, ln, frag))
+        out = ["在 %s 下发现：" % root, ""]
+        for name, items in sorted(real.items()):
+            tag = "（提示，不判定失败）" if name in warn_names else ""
+            out.append("- **%s**%s：%d 处（最多显示 5）" % (name, tag, len(items)))
+            for rel, ln, frag in items:
+                out.append("  - `%s:%d` → `%s`" % (rel, ln, frag))
     if skipped:
         out += ["", "⚠️ 有 %d 个文件**跳过未扫**（二进制 / >%dMB / 非 UTF-8）——跳过即盲区，不是「干净」："
                 % (len(skipped), MAX_FILE_BYTES // (1024 * 1024))]

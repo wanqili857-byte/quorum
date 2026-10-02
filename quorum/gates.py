@@ -65,7 +65,21 @@ def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
     dropped = stats.get("dropped_severity", 0)
     # 只数**有实质内容**的发现：problem 列至少 8 个字符。
     # 旧版只堵死了 emoji 刷屏，没堵死「表里塞 30 行空话」——那同样是空产出。
-    rows = [r for r in rows_all if len(r[2].strip()) >= 8]
+    rows_problem = [r for r in rows_all if len(r[2].strip()) >= 8]
+    # ⚠️ **位置与证据列也必须有内容**（2026-10-02，luna 独立发现；kimi 的同类观察在同一处）。
+    # 旧版只量「问题」列的长度，于是
+    #     | 🔴 |  | 这一行的问题描述凑够了八个字 |  |
+    # 是一张**能过门禁的空表**：没有任何可核实的东西，却拿走了绿灯。
+    # 工单的硬约束写着「每条必须带『我怎么查出来的』」，而门禁从来没查过那一列——
+    # 这正是这个工具反复讲的那件事：**门禁检查的是它自己定义的性质，不是读者以为的那个性质。**
+    #
+    # **但只在「那一列被认出来了」时才要求**：列名认不出来时位置列会整列为空，
+    # 那种情形下丢发现是错的（缺的是信息，不是结论）——见 test_row_alias 的那条测试。
+    _need_loc = bool(stats.get("has_位置"))
+    _need_ev = bool(stats.get("has_证据"))
+    rows = [r for r in rows_problem
+            if (not _need_loc or r[1].strip()) and (not _need_ev or r[3].strip())]
+    hollow = len(rows_problem) - len(rows)
     marks = len(SEVERITY_RE.findall(text))
     missing = [s for s in cfg.gates.require_sections if s not in text]
     passed = (len(text.encode()) >= cfg.gates.min_bytes
@@ -78,7 +92,10 @@ def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
     # 被解析成 0 条，整轮白跑）。
     hint = ""
     if not passed and not rows and not blocked:
-        if rows_all:
+        if rows_problem:
+            hint = ("有严重度表、问题列也够长，但有 %d 行的**「位置」或「证据」列是空的**"
+                    "——按空话处理。工单要求每条带「我怎么查出来的」" % hollow)
+        elif rows_all:
             hint = "有严重度表，但每行「问题」列不足 8 字，按空话处理"
         elif "|" in text and "严重度" in text:
             hint = ("看着像严重度表却没解析出任何行——检查表头是否含「严重度」列、"
@@ -106,6 +123,10 @@ def evaluate(cfg: Config, text: str, rc: int, seconds: int) -> GateResult:
                  "（认：%s）。不挡门禁，但交叉表按位置对齐会退化"
                  % (len(rows), " / ".join(COLUMN_ALIASES["位置"])))
         hint = (hint + "；" + warn3) if hint else warn3
+    if hollow and rows:
+        warn4 = ("另有 %d 行的「位置」或「证据」列是空的，已按空话丢弃——"
+                 "它们看着像发现，但没有任何可核实的东西" % hollow)
+        hint = (hint + "；" + warn4) if hint else warn4
     return GateResult(passed, len(text.encode()), marks, missing, rc, seconds,
                       findings=len(rows), blocked=blocked, hint=hint)
 
@@ -137,9 +158,24 @@ def run_with_timeout(argv: List[str], env: Dict[str, str], timeout_s: int,
 
 
 def protect_existing(path: str) -> str:
-    """已有非空结论 → 先留档，返回留档路径（空串表示无需留档）。"""
+    """已有非空结论 → 先留档，返回留档路径（空串表示无需留档）。
+
+    ⚠️ 留档名带秒级时间戳，**同一个名字被占用时要往后找一个空的**（2026-10-02，luna 独立发现）。
+    旧版直接 `shutil.move(path, keep)` —— 同一秒内对同一个 path 调用两次时，
+    第二次的目标 `.bak` 已经存在，`shutil.move` 会**静默覆盖**掉第一份留档。
+    也就是说：**用来防丢东西的那一步，自己会丢东西。**
+
+    这不是纯理论：`run` 里失败产出的路径带 `%H%M%S`，而一个**立刻失败**的通道
+    （凭据错、CLI 没装）在一秒内跑完两轮是可能的。留档是最后一道防线，
+    它不该有一个「偏偏在最需要它的时候失效」的窗口。
+    """
     if os.path.exists(path) and os.path.getsize(path) > 0:
-        keep = "%s.%s.bak" % (path, datetime.now().strftime("%H%M%S"))
+        stamp = datetime.now().strftime("%H%M%S")
+        keep = "%s.%s.bak" % (path, stamp)
+        n = 1
+        while os.path.exists(keep):          # 绝不覆盖已有留档
+            n += 1
+            keep = "%s.%s-%d.bak" % (path, stamp, n)
         shutil.move(path, keep)
         return keep
     return ""
@@ -171,11 +207,30 @@ def header(cfg: Config, reviewer_name: str, snapshot_line: str, extra: str = "")
     return "\n".join(lines)
 
 
+_TMP_SEQ = 0        # 临时文件名的进程内序号，见 atomic_write
+
+
 def atomic_write(path: str, text: str) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    """先写临时文件再 `os.replace` —— 中途崩了不会留下一份半截的结论。
+
+    ⚠️ 临时名带 pid 与一个进程内计数器（2026-10-02，luna 独立发现旧版是固定的
+    `path + ".tmp"`）。固定名在**同一路径被并发写**时会互相踩：两个写入者打开同一个
+    临时文件、交叉写进去，`os.replace` 落位的是一份**两份内容交错**的文件——
+    而那比没有结论更糟，因为它看起来是一份正常结论。
+    """
+    global _TMP_SEQ
+    _TMP_SEQ += 1
+    tmp = "%s.tmp.%d.%d" % (path, os.getpid(), _TMP_SEQ)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):              # 写失败/替换失败时别留垃圾
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def log(cfg: Config, reviewer: str, result: GateResult, label: str) -> None:
@@ -335,6 +390,15 @@ def split_table_rows(text: str, stats: Dict[str, int] = None) -> List[Tuple[str,
             if hdr:
                 in_table = True
                 idx = hdr
+                # ⚠️ 记下**哪些列名被认出来了**。调用方要拿它区分两件截然不同的事：
+                #   「列名没认出来」→ 信息缺失，**发现不能丢**（见 test_row_alias 那条测试）
+                #   「列认出来了、格子空着」→ 这一行是**空的**，不该算发现
+                # 不区分的话，两种都会变成「位置为空」。2026-10-02 的处置里踩过这个坑：
+                # 第一版直接按「位置/证据为空就丢」，把前者一起误伤了。
+                if stats is not None:
+                    for col in ("位置", "证据"):
+                        if col in idx:
+                            stats["has_" + col] = 1
                 continue
         if not in_table:
             continue

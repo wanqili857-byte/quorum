@@ -10,8 +10,21 @@
 #
 # 接哪家模型、哪个 CLI 都行 —— 内置的起法只是**机制示例**，不是全部选项：
 #   kind: claude-cli   任何 Anthropic 兼容端点（换厂商只改 env，不动代码）
-#   kind: codex-cli    本机 codex CLI
+#   kind: codex-cli    本机 codex CLI（**只认 responses 协议**）
+#   kind: opencode-cli 本机 opencode CLI（自带协议适配，只给 chat/completions 的端点也能接）
+#                       ⚠️ 它的 `OPENCODE_CONFIG_CONTENT` 里**必须**有 `permission`，
+#                       否则 quorum 拒绝启动——opencode 默认把 `external_directory` 设成
+#                       "ask"，而 headless 跑没人能批，审核员会**静默卡死**（退出码还是 0）。
+#                       最小可用的一组见 CONTRACT.md，或 quorum/channels.py 的 _OPENCODE_PERM_HELP
 #   kind: exec         任何别的 CLI（自己写 argv）
+#
+# ⚠️ 起审核员之前先跑一次 `quorum preflight --config 本文件 --all`。它问两个问题：
+#    ① 凭据对照 —— 用一条**故意错的凭据**反证「请求真的经过了这里声明的那个端点」。
+#       不做这一步，通道凭据没生效时你拿到的是一份**来源标签是错的**结论，而那在
+#       后续任何环节都看不出来——真发生过，连着四轮。注意：**用户级配置会盖过进程环境变量**
+#       （claude-cli 是用户级 settings；opencode 是 $XDG_DATA_HOME 下的 auth.json），
+#       所以「我设了环境变量」从来不等于「通道会用它」，这是默认行为不是意外。
+#    ② 模型身份 —— 读应答里带的模型名，抓**别名映射**（声明 `X-pro` 而端点回 `X` 这类降级）。
 #
 # 真实的多厂商配置见 examples/ —— 那也只是例子，照抄要改成你自己的。
 
