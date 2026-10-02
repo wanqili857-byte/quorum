@@ -802,7 +802,7 @@ def test_jobs_negative_warns_without_attribution(tmp_path):
 
 
 # ------------------------------------------------------------ verify 的环境
-def test_check_env_prefers_the_project_venv(tmp_path):
+def test_check_env_prefers_the_project_venv(tmp_path, monkeypatch):
     """check 的环境必须认**被审项目**的 venv，不能只认 quorum 自己的。
 
     真实事故：同一份台账，CI 判「说谎 **0**」、本地判「说谎 **12**」——
@@ -816,11 +816,31 @@ def test_check_env_prefers_the_project_venv(tmp_path):
 
     bare = tmp_path / "bare"
     bare.mkdir()
+
+    # ⚠️ 把「跑 quorum 的那个解释器」**假装**成住在某个 .venv/bin 里。
+    #
+    # 为什么必须假装，而不能靠跑测试时真实的环境：下面那条断言要区分
+    # 「**项目自己的** .venv/bin（不存在，不许塞）」和
+    # 「**跑 quorum 的解释器自己**所在的 .venv/bin（合法）」。
+    # 只有当天跑 pytest 的那个解释器碰巧住在 .venv/bin 里时，这个区分才被考到——
+    # 而那样**同一条测试的结果就取决于用哪个解释器跑它**：
+    #   `./.venv/bin/python -m pytest` → 红；`python3 -m pytest` → 绿；CI 用 setup-python → 绿。
+    # 也就是说：那个「不许按路径结尾判」的守卫，自己会变成「按跑它的机器判」。
+    # （2026-10-02，luna 的原始日志里露出来的副产品：它用 `.venv/bin/python` 跑 pytest，
+    #   70 passed / 1 failed，而它没来得及把这条写进结论。）
+    #
+    # monkeypatch 之后，考的是**行为**而不是**环境**——换哪个解释器跑都考同一件事。
+    fake = str(tmp_path / "somewhere" / ".venv" / "bin" / "python")
+    monkeypatch.setattr(sys, "executable", fake)
     parts = ledger._check_env(str(bare))["PATH"].split(os.pathsep)
-    assert not any(p.endswith(os.path.join(".venv", "bin")) for p in parts), \
-        "没有 .venv 时不许往 PATH 里塞一个不存在的目录"
-    assert parts[0] == os.path.dirname(os.path.abspath(sys.executable)), \
+
+    assert str(bare / ".venv" / "bin") not in parts, \
+        "没有 .venv 时把**项目自己的** .venv/bin 塞进了 PATH（那个目录不存在）"
+    assert parts[0] == os.path.dirname(fake), \
         "没有项目 venv 时退回旧语义：用跑 quorum 的那个解释器"
+    # 正例：那个目录**以 .venv/bin 结尾**，而它是合法的——旧断言正是在这里判错的。
+    assert parts[0].endswith(os.path.join(".venv", "bin")), \
+        "这个用例的前提是解释器所在目录以 .venv/bin 结尾，否则它考不到那条区分"
 
 
 def test_check_leaks_skips_its_fixture_by_content_not_path(tmp_path):
