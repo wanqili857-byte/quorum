@@ -20,4 +20,7 @@ jobs:
       # 处置台账里的断言必须真的能跑。
       # 这条是补上的：台账曾经自己烂掉过一次 —— 第 3 行指向一个已被改名的测试，
       # 而 status 还写着 ✅。当时只有人工跑 verify 才发现。台账越厚，这个缺口越大。
-      - run: quorum verify --config reviews/review.yaml
+      #
+      # `--no-incidents`：CI 上写的「台账说谎记录」没人会看，而且会弄脏工作区。
+      # 那份档案的读者是**本地跑的人**，所以只在本地写。
+      - run: quorum verify --config reviews/review.yaml --no-incidents

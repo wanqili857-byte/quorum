@@ -13,6 +13,10 @@ repo: ..
 brief: brief.md
 out_dir: out
 ledger: dispose.md          # 相对本文件 → reviews/dispose.md
+# 台账说谎记录（**事实**档案，机器写）。与 `docs/LESSONS.md`（**判断**，人写）分工不同：
+# 这里只记「哪一行、哪条命令、真实输出、材料快照」。同一条反复红不追加，只涨次数。
+# CI 里显式 `--no-incidents`：那边写的档案没人看，还会弄脏工作区。
+incidents: incidents.md     # 相对本文件 → reviews/incidents.md
 sources: ["quorum", "tests", "demo", "docs", "templates",
           "CONTRACT.md", "README.md", "reviews"]
 snapshot_exclude: ["reviews/out", "demo/out", ".venv", "__pycache__"]

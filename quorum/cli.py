@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Tuple
 
-from . import channels, gates, ledger, leaks, plate, preflight, snapshot
+from . import channels, gates, incidents, ledger, leaks, plate, preflight, snapshot
 from .config import ConfigError, load
 
 OK, FAIL = "✅", "✗"
@@ -245,6 +245,39 @@ def cmd_plate(a) -> int:
 
 
 # ------------------------------------------------------------------ verify
+def _record_incidents(cfg, a, ledger_path: str, verdicts) -> None:
+    """把 🔴 落进**台账说谎记录**（事实档案）。
+
+    **绝不影响 verify 的退出码。** 写档案失败只意味着"这次没留痕"，不意味着台账有了
+    新结论——同 §「内容优先于退出码」。所以这里的失败一律打印、不抛出。
+
+    ⚠️ 判据与 ``ledger.exit_code`` 一致：只有 ``LIE`` 是"唯一不可接受的一档"。
+    ``error``（命令没跑起来）默认不记——它常属于「门禁的结果取决于跑它的机器」那一类。
+    """
+    if getattr(a, "no_incidents", False):
+        return
+    dest = a.incidents or cfg.incidents_abs
+    if not dest:
+        return                                   # 没配 = 不写。不是"写到默认路径"
+    include_error = bool(getattr(a, "incidents_include_error", False))
+    want = [v for v in verdicts
+            if v.verdict == "LIE" or (include_error and v.verdict == "error")]
+    if not want:
+        return
+    try:
+        fp = snapshot.take(cfg).digest
+    except Exception:                            # 指纹取不到不该挡住记录
+        fp = ""
+    try:
+        new, upd = incidents.record(verdicts, ledger_path, dest, repo=cfg.repo,
+                                    snapshot_fp=fp, include_error=include_error)
+    except Exception as e:                       # 同上：不改变本次判定
+        print("\n⚠️ 台账说谎记录写入失败（不影响本次判定）：%s" % e)
+        return
+    if new or upd:
+        print("\n台账说谎记录 → %s（新增 %d · 更新 %d）" % (dest, new, upd))
+
+
 def cmd_verify(a) -> int:
     cfg = load(a.config)
     path = a.ledger or cfg.ledger or os.path.join(cfg.out_dir_abs, "%s-dispose.md" % cfg.project)
@@ -260,6 +293,7 @@ def cmd_verify(a) -> int:
         print("台账里没有可解析的行：%s" % path); return 1
     verdicts = ledger.run_checks(entries, cfg.repo, a.timeout)
     print(ledger.render(verdicts))
+    _record_incidents(cfg, a, path, verdicts)
     return ledger.exit_code(verdicts, a.strict)
 
 
@@ -348,6 +382,11 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--ledger", default="")
     v.add_argument("--strict", action="store_true", help="「无断言」也算失败")
     v.add_argument("--timeout", type=int, default=120)
+    v.add_argument("--incidents", default="",
+                   help="台账说谎记录（事实档案）路径；覆盖配置里的 incidents。按 CWD 解析")
+    v.add_argument("--no-incidents", action="store_true", help="本次不写记录（覆盖配置）")
+    v.add_argument("--incidents-include-error", action="store_true",
+                   help="连「命令没跑起来」也记（默认只记「台账说谎」）")
     v.set_defaults(func=cmd_verify)
 
     k = sub.add_parser("check-leaks", help="泄漏自检")

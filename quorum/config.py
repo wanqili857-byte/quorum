@@ -101,6 +101,10 @@ class Config:
     gates: Gates
     sources: List[str] = field(default_factory=list)
     ledger: str = ""
+    # 台账说谎记录（verify 判出 🔴 时自动落盘的**事实**档案）。
+    # 留空 = 不写 —— 默认关闭，不改动任何既有行为。语义与 ledger 一致：
+    # 相对路径按**配置文件所在目录**解析。
+    incidents: str = ""
     snapshot_exclude: List[str] = field(default_factory=list)
     leak_patterns: Dict[str, str] = field(default_factory=dict)
     path: str = ""
@@ -121,6 +125,11 @@ class Config:
     @property
     def out_dir_abs(self) -> str:
         return self._resolve(self.out_dir)
+
+    @property
+    def incidents_abs(self) -> str:
+        """台账说谎记录的位置。**空字符串 = 不写**（默认），不是「写到默认路径」。"""
+        return self._resolve(self.incidents) if self.incidents else ""
 
     def brief_for_prompt(self) -> str:
         """给审核员看的工单路径：在 repo 内就给相对路径（它的 cwd 是 repo），否则给绝对路径。
@@ -225,6 +234,7 @@ def load(path: str) -> Config:
         reviewers=reviewers, channels=channels, gates=gates,
         sources=list(raw.get("sources") or []),
         ledger=raw.get("ledger", ""),
+        incidents=raw.get("incidents", ""),
         snapshot_exclude=list(raw.get("snapshot_exclude") or []),
         leak_patterns=dict(raw.get("leak_patterns") or {}),
         path=path,

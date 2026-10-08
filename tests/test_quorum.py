@@ -15,7 +15,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from quorum import gates, ledger, leaks, plate, snapshot          # noqa: E402
+from quorum import gates, incidents, ledger, leaks, plate, snapshot          # noqa: E402
 from quorum.cli import main                                        # noqa: E402
 from quorum.config import ConfigError, load                        # noqa: E402
 
@@ -1397,3 +1397,130 @@ def test_ipv4_rule_excludes_loopback_but_still_catches_private_ips(tmp_path):
     rows = hits.get("IPv4", [])
     assert any(private in r[2] for r in rows), "真内网地址没被抓到——这不是收窄，是关掉"
     assert not any("127." in r[2] for r in rows), "环路地址被报成了泄漏（假警报）：%r" % (rows,)
+
+
+# ------------------------------------------------- 台账说谎记录（incidents）
+# 与 docs/LESSONS.md 的分工：那边是**判断**（人写：这条算什么事故、叫什么），
+# 这边是**事实**（机器写：哪一行、哪条命令、真实输出）。所以下面的断言全部只针对
+# "事实有没有被如实记下来"，不针对"这条算不算一次事故"。
+def _ledger_rows(p, rows):
+    p.write_text("| # | 问题 | check | status |\n|---|---|---|---|\n" + "".join(rows),
+                 encoding="utf-8")
+    return str(p)
+
+
+def _proj(tmp_path, rows, extra_cfg=""):
+    d = tmp_path / "p"
+    d.mkdir(exist_ok=True)
+    (d / "b.md").write_text("# 工单\n", encoding="utf-8")
+    (d / "review.yaml").write_text(
+        "project: p\nrepo: .\nbrief: b.md\nout_dir: out\nledger: dispose.md\n"
+        "channels: {c: {kind: fake, argv: ['true']}}\n"
+        "reviewers: [{name: r, channel: c, vendor: v}]\n" + extra_cfg,
+        encoding="utf-8")
+    _ledger_rows(d / "dispose.md", rows)
+    return d
+
+
+def test_incidents_records_only_lie(tmp_path):
+    """只有 `LIE` 是「唯一不可接受的一档」，档案里也只该有它。"""
+    led = _ledger_rows(tmp_path / "d.md", [
+        "| 1 | 说谎的 | `exit 1` | ✅ |\n",
+        "| 2 | 真修好的 | `exit 0` | ✅ |\n",
+        "| 3 | 没断言的 | | ✅ |\n",
+    ])
+    v = ledger.run_checks(ledger.parse(led), str(tmp_path))
+    dest = str(tmp_path / "incidents.md")
+    assert incidents.record(v, led, dest, repo=str(tmp_path)) == (1, 0)
+    text = open(dest, encoding="utf-8").read()
+    assert "exit 1" in text
+    assert "exit 0" not in text, "把一条已经修好的行也记进了事故档案"
+
+
+def test_incidents_writes_nothing_when_there_is_no_lie(tmp_path):
+    """没有 🔴 就**不建文件**。空档案会被读成「今天没事故」，而它只说明没人写过。"""
+    led = _ledger_rows(tmp_path / "d.md", ["| 1 | 好的 | `exit 0` | ✅ |\n"])
+    v = ledger.run_checks(ledger.parse(led), str(tmp_path))
+    dest = tmp_path / "incidents.md"
+    assert incidents.record(v, led, str(dest), repo=str(tmp_path)) == (0, 0)
+    assert not dest.exists()
+
+
+def test_incidents_counts_repeats_instead_of_appending(tmp_path):
+    """同一条反复红**不追加新行**，只涨次数——否则假警报会淹没真警报。"""
+    led = _ledger_rows(tmp_path / "d.md", ["| 1 | 说谎的 | `exit 1` | ✅ |\n"])
+    dest = str(tmp_path / "incidents.md")
+    for _ in range(3):
+        incidents.record(ledger.run_checks(ledger.parse(led), str(tmp_path)), led, dest,
+                         repo=str(tmp_path))
+    rows = incidents._load(dest)
+    assert len(rows) == 1, "同一条被记成了 %d 行" % len(rows)
+    assert list(rows.values())[0]["次数"] == "3"
+
+
+def test_incident_key_survives_a_line_shift(tmp_path):
+    """台账中间插一行，下面的行号整体 +1 —— 那不该被记成一条新事故。
+
+    行号若参与 key，档案就会随台账增删整片重记，去重当场失效。
+    """
+    dest = str(tmp_path / "incidents.md")
+    led = _ledger_rows(tmp_path / "a.md", ["| 1 | 说谎的 | `exit 1` | ✅ |\n"])
+    incidents.record(ledger.run_checks(ledger.parse(led), str(tmp_path)), led, dest,
+                     repo=str(tmp_path))
+    led = _ledger_rows(tmp_path / "a.md", [
+        "| 1 | 新加的 | `exit 0` | ✅ |\n",
+        "| 2 | 说谎的 | `exit 1` | ✅ |\n",
+    ])
+    assert incidents.record(ledger.run_checks(ledger.parse(led), str(tmp_path)), led, dest,
+                            repo=str(tmp_path)) == (0, 1), "行号漂移被当成了新事故"
+    assert len(incidents._load(dest)) == 1
+
+
+def test_incidents_ignore_error_unless_asked(tmp_path):
+    """「命令没跑起来」默认不记 —— 它常属于「门禁的结果取决于跑它的机器」那一类。"""
+    led = _ledger_rows(tmp_path / "d.md", ["| 1 | 跑不起来的 | `sleep 5` | ⬜ |\n"])
+    v = ledger.run_checks(ledger.parse(led), str(tmp_path), timeout_s=1)
+    assert v[0].verdict == "error"
+    dest = tmp_path / "incidents.md"
+    assert incidents.record(v, led, str(dest), repo=str(tmp_path)) == (0, 0)
+    assert not dest.exists()
+    assert incidents.record(v, led, str(dest), repo=str(tmp_path), include_error=True) == (1, 0)
+
+
+def test_verify_writes_no_incidents_unless_configured(tmp_path, capsys):
+    """**默认关闭**：没配 `incidents` 的仓库，行为与从前一模一样。"""
+    d = _proj(tmp_path, ["| 1 | 说谎的 | `exit 1` | ✅ |\n"])
+    assert main(["verify", "--config", str(d / "review.yaml")]) == 1
+    assert "台账说谎 1" in capsys.readouterr().out
+    assert not (d / "incidents.md").exists()
+    assert not list(d.glob("**/incidents.md")), "没配却写出了档案"
+
+
+def test_verify_writes_incidents_when_configured(tmp_path, capsys):
+    d = _proj(tmp_path, ["| 1 | 说谎的 | `exit 1` | ✅ |\n"],
+              extra_cfg="incidents: inc.md\n")
+    assert main(["verify", "--config", str(d / "review.yaml")]) == 1
+    assert "台账说谎记录" in capsys.readouterr().out
+    text = (d / "inc.md").read_text(encoding="utf-8")
+    assert "exit 1" in text and "台账说谎记录" in text
+
+
+def test_verify_exit_code_survives_incident_write_failure(tmp_path, capsys):
+    """写档案失败**不许改变本次判定** —— 没留痕 ≠ 台账有了新结论。
+
+    同 §「内容优先于退出码」：退出码描述的是进程，不是材料。
+    """
+    d = _proj(tmp_path, ["| 1 | 说谎的 | `exit 1` | ✅ |\n"],
+              extra_cfg="incidents: blocker/inc.md\n")
+    (d / "blocker").write_text("我是文件不是目录\n", encoding="utf-8")
+    assert main(["verify", "--config", str(d / "review.yaml")]) == 1
+    out = capsys.readouterr().out
+    assert "台账说谎 1" in out
+    assert "写入失败" in out, "写不进去却一声不吭 —— 那和「没发现」长得一样"
+
+
+def test_verify_no_incidents_flag_overrides_config(tmp_path, capsys):
+    d = _proj(tmp_path, ["| 1 | 说谎的 | `exit 1` | ✅ |\n"],
+              extra_cfg="incidents: inc.md\n")
+    assert main(["verify", "--config", str(d / "review.yaml"), "--no-incidents"]) == 1
+    assert not (d / "inc.md").exists()
