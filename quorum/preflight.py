@@ -99,6 +99,22 @@ def credential_keys(env: Dict[str, str]) -> List[str]:
     return sorted(k for k in env if _CRED.search(k))
 
 
+def _scrub(text: str, env: Dict[str, str]) -> str:
+    """把 env 里的凭据值从**要外露的文本**里抹掉。
+
+    ⚠️ 这不是可选的。`_resolve_env` 已经把 `*_FILE` 解成**裸值**放回 env，
+    所以任何从子进程带出来、再打进终端的文本都可能夹着真密钥。白名单式的
+    正则匹配靠不住——2026-10-08 作者本人就是因为脱敏正则只匹配 `sk-` 前缀、
+    漏了 `tp-` 前缀，把一个真实 token 打进了对话记录。这里改成**按值替换**：
+    env 里凡是 `_CRED` 命中的键，它的值在文本里一律换成 `***`。
+    """
+    for k in credential_keys(env):
+        v = env.get(k) or ""
+        if len(v) >= 8:
+            text = text.replace(v, "***")
+    return text
+
+
 # ------------------------------------------------ 模型身份探针（第二条轴）
 #
 # 凭据探针证的是「请求经过了声明的端点」。**它证不了端点回话的是谁。** 这一条补另外半边：
@@ -214,14 +230,20 @@ def _credential_controls(cfg: Config, name: str, timeout_s: int = 120) -> Verdic
     # （2026-10-02 实测：真 key 6.7s / rc=0 / 输出 `OK`；坏 key 90s 没动静）。
     # 于是「没成功」这一个信号同时对应两种完全不同的现实——「凭据被拒」和
     # 「这条通道根本是死的」。光看阴性分不开，而分不开就会把死通道报成「已核实」。
-    pos_rc, pos_body, pos_secs = _invoke(cfg, argv, env, writes_file, timeout_s,
-                                         name + "-pos")
+    pos_rc, pos_body, pos_err, pos_secs = _invoke(cfg, argv, env, writes_file, timeout_s,
+                                                  name + "-pos")
     if pos_rc != 0 or not pos_body:
+        # 把子进程自己说的话带出来（凭据先抹掉）。阳性对照失败时，「为什么失败」几乎
+        # 只写在 stderr 上——不带出来，这一档就只能报「产出 0 字」，于是
+        # **网络出口不通与 CLI 没装长得一模一样**（2026-10-08 的实际代价：手工重跑才定位）。
+        raw = _scrub(pos_err or pos_body, env).strip()
+        ev = ("\n        子进程说的（末 400 字，凭据已抹）：%s" % raw[-400:]) if raw else ""
         return Verdict(name, r.channel, ch.kind, "channel_down",
                        "**阳性对照就没过**：真凭据下 %ds 后 rc=%s、产出 %d 字。"
                        "这条通道自己起不来（凭据错/端点错/CLI 没装），"
                        "所以**「端点属不属实」这件事这次没有验过**——别把这一行读成通过。"
-                       % (pos_secs, pos_rc, len(pos_body)),
+                       "%s"
+                       % (pos_secs, pos_rc, len(pos_body), ev),
                        creds, endpoint, pos_secs)
 
     # ---- 阴性对照：只把凭据换成故意错的 -------------------------------------
@@ -229,8 +251,8 @@ def _credential_controls(cfg: Config, name: str, timeout_s: int = 120) -> Verdic
     # 上限由**实测基线**推出来，不是一个拍脑袋的常数：被劫持的通道会像阳性一样几秒就回话，
     # 所以只要比基线宽出几倍还没动静，就足以判「它不是成功，是被拒了」。
     neg_cap = int(min(timeout_s, max(25, 3 * pos_secs + 15)))
-    neg_rc, neg_body, neg_secs = _invoke(cfg, argv, poisoned_env, writes_file, neg_cap,
-                                         name + "-neg")
+    neg_rc, neg_body, neg_err, neg_secs = _invoke(cfg, argv, poisoned_env, writes_file, neg_cap,
+                                                  name + "-neg")
 
     if neg_rc == 0 and neg_body:
         return Verdict(name, r.channel, ch.kind, "hijacked",
@@ -238,7 +260,7 @@ def _credential_controls(cfg: Config, name: str, timeout_s: int = 120) -> Verdic
                        "请求被路由到了别处。产出前 80 字：%r。"
                        "修法（claude-cli 最常见）：CLI 读了自己的用户级 settings，"
                        "进程环境变量被盖过——加 `--setting-sources project`。"
-                       % (neg_secs, neg_body[:80]),
+                       % (neg_secs, _scrub(neg_body[:80], env)),
                        creds, endpoint, pos_secs)
     if neg_rc == -9:
         # ⚠️ **「没返回」和「被拒」是两件事，不能混成一句话。**
@@ -261,7 +283,14 @@ def _credential_controls(cfg: Config, name: str, timeout_s: int = 120) -> Verdic
 
 def _invoke(cfg: Config, argv: List[str], env: Dict[str, str], writes_file: bool,
             cap: int, tag: str):
-    """跑一次探针，返回 (rc, 产出文本, 用时秒)。只用临时文件，不碰任何结论路径。"""
+    """跑一次探针，返回 (rc, 产出文本, stderr 文本, 用时秒)。只用临时文件，不碰任何结论路径。
+
+    ⚠️ **stderr 必须带出来**（2026-10-08 补）。看门狗一直把 stderr 写进文件，
+    但这里从来没读过它 —— 于是阳性对照失败时，`channel_down` 只能报「产出 0 字」，
+    而「为什么失败」几乎只写在 stderr 上。实例：opencode 把
+    `Country, region, or territory not supported` 打在 stderr，被丢掉之后，
+    「网络出口不通」和「CLI 没装」在报告里长得一模一样，害得人手工重跑才找到根因。
+    """
     fd, out = tempfile.mkstemp(prefix="quorum-preflight-%s-" % tag)
     os.close(fd)
     err, stream = out + ".err", out + ".stream"
@@ -275,7 +304,8 @@ def _invoke(cfg: Config, argv: List[str], env: Dict[str, str], writes_file: bool
         rc = gates.run_with_timeout(argv, env, cap, stdout_path, err, cwd=cfg.repo)
         secs = int(round(time.time() - t0))
         body = (gates.read_text(out) + gates.read_text(stdout_path)).strip()
-        return rc, body, secs
+        stderr = gates.read_text(err).strip()
+        return rc, body, stderr, secs
     finally:
         for f in (out, err, stream):
             try:
