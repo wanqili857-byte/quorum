@@ -101,3 +101,48 @@ def test_unknown_severity_marker_is_reported_not_swallowed():
     r = gates.evaluate(_cfg(), t + "\n" + filler + "\n\n## 最脆弱\n\nx\n", rc=0, seconds=1)
     assert r.hint and "丢弃" in r.hint, "丢弃行必须出声"
     assert "少算" in r.hint
+
+
+# --------------------------------------------------------------- 2026-10-08
+# quant 第 2 轮：**同一个病根第二次发作** —— 工单的表头写法解析器不认，
+# 于是 13KB 的审核被算成 0 条发现。第 1 轮三家也死在这里，当时我只归因成
+# 「格式不符」没查根因，所以原样重演。两条都钉住。
+
+def test_header_the_brief_actually_wrote_is_recognized():
+    """`| 严重度 | 声明编号 | 发现 | 我怎么查出来的——附可复跑命令 |` 必须认。
+
+    当时三列里**一个都认不出**：「声明编号」「发现」不在别名表；第四列以「我」开头，
+    而别名走 `startswith("怎么查出来的")`。`_header_map` 要求 ≥2 列被认出 →
+    判为不是表头 → 整份 0 条，**而且提示语指错方向**（叫你去查「表头有没有严重度列」，
+    而那列一直是好的）。
+    """
+    text = ("前面直接接正文，没有空行\n"
+            "| 严重度 | 声明编号 | 发现 | 我怎么查出来的——附可复跑命令 |\n"
+            "|---|---|---|---|\n"
+            "| 高 | D1 | 这一行的问题描述凑够八个字以上 | 命令 A |\n"
+            "| 中 | D2 | 这一行的问题描述也凑够八个字 | 命令 B |\n")
+    rows = gates.split_table_rows(text)
+    assert len(rows) == 2, rows
+    assert [r[1].strip() for r in rows] == ["D1", "D2"], "「声明编号」要映射到位置列"
+
+
+def test_bare_chinese_severity_is_accepted_in_the_cell_only():
+    """工单写「严重度用 高/中/低」，审核员就写裸中文 —— 只认 `[高]` 会把它们全丢掉。
+
+    ⚠️ 放宽**只许作用于严重度单元格**。`SEVERITY_RE` 还被用于在**全文**里数标记
+    （防「概述表凑合规」那条线）；往里加裸的「中」「高」，会把「中国」「集中」
+    「提高」全算成严重度标记，那条防线当场失效 —— 两个用途的精度要求相反。
+    所以最后那两行断言不是凑数：钉的就是「别图省事改回一个正则」。
+    """
+    text = ("| 严重度 | 位置 | 问题 | 证据 |\n|---|---|---|---|\n"
+            "| 高 | a.py:1 | 这一行的问题描述凑够八个字以上 | cmd |\n"
+            "| 中 | b.py:2 | 这一行的问题描述凑够八个字以上 | cmd |\n"
+            "| 低 | c.py:3 | 这一行的问题描述凑够八个字以上 | cmd |\n")
+    stats = {}
+    rows = gates.split_table_rows(text, stats)
+    assert len(rows) == 3, (rows, stats)
+    assert stats["dropped_severity"] == 0
+    assert [gates.severity_of(r[0]) for r in rows] == [4, 2, 1]
+
+    # 全文计数那条线没被放宽 —— 普通中文里的「中」「高」不算标记
+    assert len(gates.SEVERITY_RE.findall("中国市场集中度提高，高风险")) == 0

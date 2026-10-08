@@ -24,6 +24,18 @@ from .config import Config
 
 SEVERITY_RE = re.compile(r"🔴|🟠|🟡|🟢|\[严重\]|\[高\]|\[中\]|\[低\]")
 
+# 严重度**单元格**专用的放宽版：这一格只可能是档位本身，所以允许**不带方括号**的中文档位。
+#
+# 为什么不直接放宽上面那个：`SEVERITY_RE` 还被用来在**全文**里数标记
+# （`marks = len(SEVERITY_RE.findall(text))`，见「概述表凑合规」那条防线）。
+# 往它里面加裸的「中」「高」，会把「中国」「集中」「提高」全算成严重度标记，
+# 那条防线当场失效 —— 两个用途的精度要求相反，必须分开。
+#
+# 实测（quant 第 2 轮，2026-10-08）：工单写「严重度用 高/中/低 三档」，
+# 三家就老老实实写裸的 `高`/`中`/`低`，于是 `SEVERITY_RE.search(sev)` 全不匹配，
+# **11 行发现全被 `dropped_severity` 丢掉**（表头倒是认出来了）。同一个错第 1 轮也犯过。
+SEVERITY_CELL_RE = re.compile(r"🔴|🟠|🟡|🟢|严重|高|中|低")
+
 # 「审核员卡住了」与「审核员交了个差结论」在门禁看来长得一样，但处置完全不同：
 # 前者要你解封权限/换通道再跑，后者要重写工单或换模型。这里给前者一个可识别的信号。
 BLOCKED_MARKERS = ("requires approval", "need a decision", "需要你", "需要授权", "无法执行",
@@ -256,11 +268,22 @@ COLUMN_NAMES = ("严重度", "位置", "问题", "证据", "建议")
 # `| # | 文件:行 | 问题 | 具体失败场景 | 严重度 | 怎么查出来的 |`，
 # 于是 25 条发现的「位置」**全空且一声不吭**，交叉表按位置对齐直接退化。
 # 这类写法是合理的——工具该认，不是让作者去改自己的习惯。
+#
+# 实测（quant 第 2 轮，2026-10-08）：工单表头写的是
+# `| 严重度 | 声明编号 | 发现 | 我怎么查出来的——附可复跑命令 |`。
+# `_header_map` 要求**至少两个**列名被认出（且含「严重度」），这三列当时一个都认不出
+# ——「声明编号」「发现」不在表里，而「我怎么查出来的…」以「我」开头，
+# 别名走 `startswith("怎么查出来的")` 也匹配不上。**于是只认出 1 列 → 判为不是表头
+# → 整份 13KB 的审核被算成 0 条发现**，还打出「看着像严重度表却没解析出任何行」这种
+# 指错方向的提示（提示让人去查「表头有没有严重度列」，而严重度那列一直是好的）。
+# 「声明编号」映射到「位置」是有意的：交叉表按它对齐，同一编号（D1/D2…）的发现正好该并排。
 COLUMN_ALIASES = {
     "严重度": ("严重度", "severity", "等级", "级别"),
-    "位置": ("位置", "文件:行", "文件", "路径", "location", "file"),
-    "问题": ("问题", "issue", "problem"),
-    "证据": ("证据", "怎么查出来的", "查证", "复现", "命令", "evidence"),
+    "位置": ("位置", "文件:行", "文件", "路径", "location", "file",
+             "声明编号", "编号", "声明", "条目"),
+    "问题": ("问题", "issue", "problem", "发现", "结论"),
+    "证据": ("证据", "怎么查出来的", "查证", "复现", "命令", "evidence",
+             "我怎么查出来的"),
     "建议": ("建议", "fix", "suggestion"),
 }
 
@@ -409,7 +432,7 @@ def split_table_rows(text: str, stats: Dict[str, int] = None) -> List[Tuple[str,
         if "严重度" not in idx:
             continue
         sev = pick(cells, "严重度")
-        if not SEVERITY_RE.search(sev):
+        if not SEVERITY_CELL_RE.search(sev):
             # 看着像发现行却没有可识别的严重度标记——**记数，别静默扔**
             if len(cells) >= 3 and any(c.strip() for c in cells[1:]):
                 dropped += 1
@@ -421,10 +444,16 @@ def split_table_rows(text: str, stats: Dict[str, int] = None) -> List[Tuple[str,
 
 
 def severity_of(sev: str) -> int:
-    if "🔴" in sev or "[严重]" in sev or "[高]" in sev:
+    """档位 → 序数。带方括号的、emoji 的、**裸中文的**都认（见 SEVERITY_CELL_RE）。
+
+    裸中文这条是 2026-10-08 补的：工单写「用 高/中/低」，审核员照写，而这里只认 `[高]`。
+    判定顺序从高到低；「严重」与「高」同档。
+    """
+    s = sev or ""
+    if "🔴" in s or "严重" in s or "高" in s:
         return 4
-    if "🟠" in sev:
+    if "🟠" in s:
         return 3
-    if "🟡" in sev or "[中]" in sev:
+    if "🟡" in s or "中" in s:
         return 2
     return 1
