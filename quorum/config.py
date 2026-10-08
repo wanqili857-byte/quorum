@@ -77,6 +77,17 @@ class Channel:
     # 很容易忘了写 harness，把两个不同的 CLI 记成同一个（plate 的独立性注记就废了）。
     # exec 通道请把标志写进 argv，不要用这个字段（配了会直接报错，见 channels.py）。
     args: List[str] = field(default_factory=list)
+    # 这条通道**要打到哪个端点**。可选，但有些通道不写就等于放弃两条预检轴。
+    #
+    # 为什么需要它：`claude-cli` / `codex-cli` 的端点写在 env 的
+    # `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 里，预检读得到；而 `opencode-cli`
+    # 的端点藏在 **CLI 自己的注册表**里，配置里看不见 —— 于是
+    # **可达性探针**（够不够得到）与**模型身份探针**（回话的是不是声明的那个模型）
+    # 双双失明，而这两条恰恰是 preflight 仅有的两轴。
+    #
+    # ⚠️ 这是**声明**，不是从 CLI 读出来的事实。写错了探针就会给人错误的信心 ——
+    # 报告里会注明端点的来源。
+    endpoint: str = ""
 
     @property
     def harness_name(self) -> str:
@@ -191,6 +202,7 @@ def load(path: str) -> Config:
             env={str(k): str(v) for k, v in (spec.get("env") or {}).items()},
             argv=list(spec.get("argv") or []),
             args=[str(a) for a in (spec.get("args") or [])],
+            endpoint=str(spec.get("endpoint") or ""),
         )
 
     reviewers = []

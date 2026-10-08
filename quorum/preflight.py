@@ -34,10 +34,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -70,7 +72,8 @@ class Verdict:
     reviewer: str
     channel: str
     kind: str
-    # verified | hijacked | channel_down | no_credential | unsupported | error
+    # verified | hijacked | channel_down | egress_blocked | no_credential
+    # | unsupported | error
     status: str
     detail: str = ""
     poisoned: List[str] = None
@@ -91,6 +94,11 @@ class Verdict:
         而误伤的闸门会被关掉，关掉之后就什么都守不住了。拦人只留给
         **没有别的检测手段**的那一种——被劫持在后续任何环节都看不见，
         它是这里唯一「只有这条预检能发现」的失败。
+
+        `egress_blocked` 同样**不拦人**，尽管它比 channel_down 确定得多：
+        探针可能误报（被测 CLI 也许有探针没有的网络能力），而可能误报的闸门
+        迟早被关掉——关掉之后就什么都守不住了。它的价值在于**说清病因**，
+        不在于拦人。
         """
         return self.status == "hijacked"
 
@@ -113,6 +121,117 @@ def _scrub(text: str, env: Dict[str, str]) -> str:
         if len(v) >= 8:
             text = text.replace(v, "***")
     return text
+
+
+# ------------------------------------------ 网络出口探针（L2, 2026-10-08 补）
+#
+# `channel_down` 此前把**四种现实**压成一档：凭据错 / 端点错 / CLI 没装 /
+# **网络出口不通**。前一、二种还能换个凭据逼近，第三种能直接看出来，第四种
+# **此前没有任何检测手段** —— 而它是最常见的一类（代理没起、代理地址写错、
+# 主机被丢包、DNS 不通）。
+#
+# 2026-10-08 的实际代价：一条 opencode 通道连续失败，真因是 gpt-6-luna 只走
+# Responses 协议而那条路径被区域封锁，叠加「Node 不读 macOS 系统代理、只认
+# HTTP(S)_PROXY」，被当成「通道起不来」排查了很久。
+#
+# ⚠️ **探针必须和被测 CLI「同样瞎」，这是要害**：只用**子进程真正拿到的**代理
+#   变量（`os.environ` 叠加通道 env 之后的结果），不掺 quorum 自己的偏好，
+#   也不用 `urllib` 的默认路径（它会 `getproxies()` 去读 `os.environ`）。
+#   **探针比被测对象聪明的那一刻，它证明的东西就没了。** 所以这里用裸 socket：
+#   既没有隐式的代理发现，也不会被「服务器不肯答某个路径」骗到。
+#
+# ⚠️ 上面那次事故**不是传输层问题**（opencode.ai 的 TCP 是通的），所以本探针
+#   抓不到它 —— 那一类靠 L1 带出子进程的理由。别把这一档读成比它实际更强。
+_REACH_TIMEOUT = 15
+
+
+def channel_endpoint(ch: Channel, env: Dict[str, str]) -> str:
+    """这条通道的端点：配置里 `endpoint:` 优先，否则取 env 里的 base URL。
+
+    `opencode-cli` 的端点藏在 **CLI 自己的注册表**里，配置看不见 —— 不显式声明的话，
+    可达性探针与模型身份探针**双双读不到它**，而这恰好是 preflight 仅有的两轴。
+    """
+    return (ch.endpoint
+            or env.get("ANTHROPIC_BASE_URL")
+            or env.get("OPENAI_BASE_URL")
+            or "").rstrip("/")
+
+
+def _dial(host: str, port: int) -> Tuple[str, str]:
+    """TCP 连一次。返回 (档位, 说明)，档位 ∈ {reachable, unreachable}。
+
+    为什么是**传输层**而不是发个 HTTP 请求就完：实测（2026-10-08）
+
+        opencode.ai         DNS 0.0s   TCP:443 OK 0.2s
+        api.openai.com      DNS 0.0s   TCP:443 超时        ← 包被丢
+        api.xiaomimimo.com  DNS 0.0s   TCP:443 OK 0.0s
+
+    发 HTTP 有两个坑：①裸 GET 打基地址，服务器可能**不回话**（不是拒绝，是挂着），
+    于是把「可达但没这条路」误判成「不可达」；②要把 base URL 拼成某个具体路径，
+    而"哪个路径算活着"本身就是猜。TCP 连一下没有这两问题，且快。
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as e:                                     # noqa: BLE001
+        return "unreachable", "DNS 解析不了 `%s`（%s）" % (host, type(e).__name__)
+    last = ""
+    # 总预算而不是每个地址各给一份：一个双栈主机 ×2 个地址族会翻倍，
+    # 而这一档只在阳性对照已经失败之后才跑，**不该再拖长失败路径**。
+    deadline = time.time() + _REACH_TIMEOUT
+    for fam, typ, proto, _canon, addr in infos:
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        s = socket.socket(fam, typ, proto)
+        s.settimeout(left)
+        try:
+            s.connect(addr)
+            return "reachable", "`%s:%d` 连得上" % (host, port)
+        except Exception as e:                                 # noqa: BLE001
+            last = "%s（%s:%d）" % (type(e).__name__, host, port)
+        finally:
+            s.close()
+    return "unreachable", last or "连不上 `%s:%d`" % (host, port)
+
+
+def _proxy_in(env: Dict[str, str]) -> str:
+    for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+              "ALL_PROXY", "all_proxy"):
+        if env.get(k):
+            return env[k]
+    return ""
+
+
+def reachability(env: Dict[str, str], url: str) -> Tuple[str, str]:
+    """从**子进程同款 env**出发，够不够得到它要打的东西。返回 (档位, 说明)。
+
+    ⚠️ **探的是子进程真正的下一跳**：
+      - 通道**声明了代理** → 探**代理**（那才是它的出口；代理没起，子进程一样出不去）；
+      - 没声明代理 → 探**端点主机**。
+
+    ⚠️ **能抓什么、抓不到什么**（写清楚，免得这一档被读成比它实际更强）：
+      - 抓得到：代理没起 / 代理地址写错 / 主机被丢包（如 api.openai.com 直连超时）/
+        DNS 解析失败。**这是最常见的一类。**
+      - **抓不到**：主机连得上、但**应用层**按地区/套餐拒你（2026-10-08 那次就是：
+        opencode.ai 的 TCP 通着，是 `/responses` 上按模型区域策略回了 403）。
+        那一类只能靠 L1 把子进程的理由带出来 —— 探针在这里会诚实地报 reachable。
+    """
+    if not url:
+        return ("unknown",
+                "配置里没声明 `endpoint:`，env 里也没有 base URL —— 无从探测")
+    proxy = _proxy_in(env)
+    if proxy:
+        try:
+            pu = urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy)
+        except Exception:                                      # noqa: BLE001
+            return "unreachable", "代理地址解析不了：%s" % proxy
+        phost, pport = pu.hostname or "", pu.port or (1080 if pu.scheme.startswith("socks") else 8080)
+        v, why = _dial(phost, pport)
+        # 代理通了就到此为止：再往后的路是代理的事，探针看不到，也不该假装看到。
+        return v, ("通道声明了代理：%s\n        %s" % (proxy, why))
+    host = urllib.parse.urlsplit(url).hostname or ""
+    port = urllib.parse.urlsplit(url).port or (443 if url.startswith("https") else 80)
+    return _dial(host, port)
 
 
 # ------------------------------------------------ 模型身份探针（第二条轴）
@@ -154,12 +273,13 @@ def probe_model(cfg: Config, name: str, timeout_s: int = 60) -> Tuple[str, str, 
     except SystemExit as e:
         return "unverifiable", ch.model, "", "通道构造失败：%s" % (e.code,)
 
-    base = env.get("ANTHROPIC_BASE_URL") or env.get("OPENAI_BASE_URL") or ""
+    base = channel_endpoint(ch, env)
     creds = credential_keys(env)
     if not (base and creds and ch.model):
         return ("unverifiable", ch.model, "",
                 "端点不在配置里（藏在 CLI 自己的注册表里），或没有凭据——"
-                "这条通道**这次没有验过模型身份**，别把它读成通过")
+                "这条通道**这次没有验过模型身份**，别把它读成通过。"
+                "修法：给这条通道加 `endpoint:`（opencode-cli 就属于这种）")
     body = json.dumps({"model": ch.model, "max_tokens": 1,
                        "messages": [{"role": "user", "content": "hi"}]}).encode()
     req = urllib.request.Request(base.rstrip("/") + "/v1/messages", data=body, method="POST",
@@ -238,13 +358,30 @@ def _credential_controls(cfg: Config, name: str, timeout_s: int = 120) -> Verdic
         # **网络出口不通与 CLI 没装长得一模一样**（2026-10-08 的实际代价：手工重跑才定位）。
         raw = _scrub(pos_err or pos_body, env).strip()
         ev = ("\n        子进程说的（末 400 字，凭据已抹）：%s" % raw[-400:]) if raw else ""
-        return Verdict(name, r.channel, ch.kind, "channel_down",
-                       "**阳性对照就没过**：真凭据下 %ds 后 rc=%s、产出 %d 字。"
-                       "这条通道自己起不来（凭据错/端点错/CLI 没装），"
-                       "所以**「端点属不属实」这件事这次没有验过**——别把这一行读成通过。"
-                       "%s"
-                       % (pos_secs, pos_rc, len(pos_body), ev),
-                       creds, endpoint, pos_secs)
+        # ---- 网络出口探针：够不到就单独成一档，不再和「凭据错/CLI 没装」混一起 ----
+        ep = channel_endpoint(ch, env)
+        reach, why = reachability(env, ep)
+        head = ("**阳性对照就没过**：真凭据下 %ds 后 rc=%s、产出 %d 字。"
+                % (pos_secs, pos_rc, len(pos_body)))
+        if reach == "unreachable":
+            detail = (head
+                      + "\n        **网络出口不通**：这条通道从它自己的 env 出发"
+                        "**够不到** `%s`。\n        探针：%s\n"
+                        "        这不是凭据问题、也不是端点写错——是**包出不去**。\n"
+                        "        最常见的原因：端点要走代理，而代理只配在 **macOS 系统设置**里；\n"
+                        "        **Unix CLI 不读系统代理**，只认 `HTTP_PROXY` / `HTTPS_PROXY`\n"
+                        "        环境变量。把它们写进**这条通道的 env**——不要只靠 shell export，\n"
+                        "        那样事后追不到「这一轮走的是哪个出口」。\n"
+                        "        另注：`small_model` 这类**副调用**用的是另一个模型，"
+                        "可能单独被墙。" % (ep, why)) + ev
+            return Verdict(name, r.channel, ch.kind, "egress_blocked", detail,
+                           creds, ep, pos_secs)
+        detail = (head
+                  + "这条通道自己起不来（凭据错/端点错/CLI 没装），"
+                    "所以**「端点属不属实」这件事这次没有验过**——别把这一行读成通过。"
+                    "\n        网络出口：%s" % why) + ev
+        return Verdict(name, r.channel, ch.kind, "channel_down", detail,
+                       creds, ep, pos_secs)
 
     # ---- 阴性对照：只把凭据换成故意错的 -------------------------------------
     #
@@ -325,6 +462,7 @@ def preflight(cfg: Config, names: List[str], timeout_s: int = 120,
 
 
 _ICON = {"verified": OK, "hijacked": FAIL, "channel_down": FAIL,
+         "egress_blocked": FAIL,
          "not_refuted": WARN, "no_credential": WARN, "unsupported": "·", "error": FAIL}
 _M_ICON = {"match": OK, "mismatch": FAIL, "unverifiable": WARN, "skipped": "·"}
 
@@ -335,9 +473,15 @@ def render(verdicts: List[Verdict]) -> str:
              "  阴性对照 —— 同样的 argv、同样的端点，**只把凭据换成故意错的**：",
              "               回话 = 凭据根本没被用上，请求被劫走了；不回话 = 端点属实。",
              "",
+             "网络出口探针（**只在阳性对照失败时跑**，不占正常路径的开销）：",
+             "  从**子进程同款 env** 出发够不够得到端点 —— 把「包出不去」",
+             "  与「凭据错 / 端点错 / CLI 没装」分开。探针按值只看路，不看协议。",
+             "",
              "模型身份探针（另发一次极小请求，读应答里带的模型名）：",
              "  抓的是**别名映射**——声明 `X-pro` 而端点回 `X` 这类降级。",
              "  证不了端点是否在应答里说谎，也证不了它在别的请求上换了模型。",
+             "  端点取自通道的 `endpoint:`，否则取 env 里的 base URL ——",
+             "  两者都没有就没法验（如未声明端点的 opencode-cli 通道）。",
              ""]
     for v in verdicts:
         enc = ("  毒化：%s" % ", ".join(v.poisoned)) if v.poisoned else ""
@@ -372,6 +516,12 @@ def render(verdicts: List[Verdict]) -> str:
                 if v.status in ("no_credential", "channel_down")]
         lines.append("  %s 没有通道被劫持" % OK
                      + ("；但 %s 那几条**这次没验过**（见上）。" % "、".join(weak) if weak else "。"))
+    egr = [v.reviewer for v in verdicts if v.status == "egress_blocked"]
+    if egr:
+        lines.append("  %s %s 的**网络出口不通** —— 包出不去，既不是凭据也不是端点。\n"
+                     "     多半是端点要走代理，而代理只配在 **macOS 系统设置**里；\n"
+                     "     Unix CLI 不读系统代理，只认 `HTTP_PROXY` / `HTTPS_PROXY`。\n"
+                     "     这几条**跑起来会白烧一整轮额度**，先修再 run。" % (FAIL, "、".join(egr)))
     nr = [v.reviewer for v in verdicts if v.status == "not_refuted"]
     if nr:
         lines.append("  %s %s：阴性对照**是被看门狗杀掉的**，不是干净地失败。"
@@ -382,7 +532,12 @@ def render(verdicts: List[Verdict]) -> str:
                      "不拦人——但结论里写「我们用 X 审的」之前，先看这一行。" % (FAIL, n_mis))
     unv = [v.reviewer for v in verdicts if v.model_status == "unverifiable"]
     if unv:
-        lines.append("  %s %s 的模型身份**这次没验过**（端点不在配置里）——别读成通过。"
+        # 不再断言原因（"端点不在配置里"）—— 现在端点是**可以声明**的，
+        # 声明了照样可能验不了（模型不走 `/v1/messages`，探针读不到模型名）。
+        # 具体原因在每条的 model_detail 里，这里只说结论。
+        lines.append("  %s %s 的模型身份**这次没验过**（原因见上）——别读成通过。"
+                     "这一轴对**不走 Anthropic 协议**的端点结构性地验不了，"
+                     "替代的事实侧核对是 CLI 自己的日志。"
                      % (WARN, "、".join(unv)))
     return "\n".join(lines)
 

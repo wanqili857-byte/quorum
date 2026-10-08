@@ -1277,6 +1277,71 @@ def test_preflight_needs_a_positive_control(tmp_path):
     assert v.blocks is False, "判不了 ≠ 判否；拦人要只留给「有唯一检测手段」的那一档"
 
 
+def test_preflight_separates_egress_from_credential_failure(tmp_path):
+    """**包出不去 ≠ 凭据错。** 这两者在报告里长得一模一样，直到 2026-10-08。
+
+    当时的形状：代理只配在 **macOS 系统设置**里，而 Node CLI 不读它、只认
+    `HTTP_PROXY`/`HTTPS_PROXY`，于是子进程出不去；而 `channel_down` 只会说
+    「凭据错/端点错/CLI 没装」，害得人手工重跑才定位。
+
+    桩：命令必失败（阳性对照过不了）+ 声明一个**死代理**（子进程真正的下一跳）。
+    """
+    from quorum import preflight
+    cfg = preflight._synthetic(
+        str(tmp_path),
+        ["/bin/sh", "-c", "echo nope >&2; exit 1"],
+        {"FAKE_KEY": "whatever",
+         "ANTHROPIC_BASE_URL": "https://example.invalid",
+         "HTTPS_PROXY": "http://127.0.0.1:1"})
+    v = preflight.probe_reviewer(cfg, "probe", timeout_s=30)
+    assert v.status == "egress_blocked", "判成了 %s" % v.status
+    assert v.blocks is False, "可能误报的档位不许拦人 —— 误伤的闸门会被关掉"
+
+
+def test_preflight_stays_channel_down_when_the_network_is_fine(tmp_path):
+    """够得到就不是网络问题 —— `egress_blocked` 不许把这一档抢走。
+
+    没有这一条，一个「永远报 egress」的实现也能让上一条测试变绿。
+    """
+    import socket
+    from quorum import preflight
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    try:
+        cfg = preflight._synthetic(
+            str(tmp_path),
+            ["/bin/sh", "-c", "echo nope >&2; exit 1"],
+            {"FAKE_KEY": "whatever",
+             "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % srv.getsockname()[1]})
+        v = preflight.probe_reviewer(cfg, "probe", timeout_s=30)
+        assert v.status == "channel_down", "判成了 %s" % v.status
+    finally:
+        srv.close()
+
+
+def test_reachability_dials_the_proxy_when_one_is_declared():
+    """通道声明了代理，就探**代理** —— 那才是子进程的下一跳，不是端点本身。"""
+    from quorum import preflight
+    v, why = preflight.reachability(
+        {"HTTPS_PROXY": "http://127.0.0.1:1"}, "https://example.invalid")
+    assert v == "unreachable", why
+    assert "127.0.0.1:1" in why
+
+
+def test_reachability_says_reachable_for_a_live_socket():
+    import socket
+    from quorum import preflight
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    try:
+        v, why = preflight.reachability({}, "http://127.0.0.1:%d" % srv.getsockname()[1])
+        assert v == "reachable", why
+    finally:
+        srv.close()
+
+
 def _run_cfg(tmp_path, argv_yaml):
     """最小可跑的 run 配置：一个 exec 桩通道 + 一个审核员。"""
     key = tmp_path / "key.txt"
