@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#f7f4ef;padding:28px;font-family:"SF Mono",Menlo,Consolas,"PingFang SC",monospace}
+  .term{background:#1b1815;border-radius:14px;padding:26px 30px 30px;width:1420px;
+        box-shadow:0 10px 30px rgba(0,0,0,.18)}
+  .dots{display:flex;gap:9px;margin-bottom:22px}
+  .dots i{width:13px;height:13px;border-radius:50%;display:block}
+  .dots i:nth-child(1){background:#ff5f57}
+  .dots i:nth-child(2){background:#febc2e}
+  .dots i:nth-child(3){background:#28c840}
+  pre{font-size:19px;line-height:1.75;color:#e8e2da;white-space:pre}
+  .p{color:#7fa8c9}
+  table{width:100%;border-collapse:collapse;font-size:18px;line-height:1.7;color:#e8e2da;
+        margin:14px 0 16px}
+  th,td{text-align:left;padding:7px 16px 7px 0;vertical-align:top;white-space:nowrap}
+  th{color:#8b8177;font-weight:400;border-bottom:1px solid #3a342e}
+  td:nth-child(3){color:#a89e93}
+  .lie{color:#ff8a5c;font-weight:700}
+  .pend{color:#8b8177}
+  .none{color:#8b8177}
+  .sum{font-size:19px;line-height:1.8;color:#e8e2da}
+  .sum b{color:#ff8a5c}
+</style>
+</head>
+<body>
+<div class="term">
+  <div class="dots"><i></i><i></i><i></i></div>
+  <pre><span class="p">$</span> quorum verify --config demo/review.yaml --ledger demo/ledger_example.md</pre>
+  <table>
+    <tr><th>#</th><th>status</th><th>check</th><th>判定</th><th>输出（截断）</th></tr>
+    <tr><td>1</td><td>✅</td><td>python3 -c "import json;…"</td><td class="lie">🔴 台账说谎</td><td>AssertionError: pred 只覆盖 41/100</td></tr>
+    <tr><td>2</td><td>⬜</td><td>python3 -c "import re;s=open(…"</td><td class="pend">⬜ 未修</td><td>AssertionError: 正文只剩 6 字</td></tr>
+    <tr><td>3</td><td>⬜</td><td>grep -q 'keys = sorted(' …</td><td class="pend">⬜ 未修</td><td></td></tr>
+    <tr><td>4</td><td>✅</td><td>-</td><td class="none">⚪ 无断言</td><td></td></tr>
+  </table>
+  <div class="sum">合计 4 条：<b>台账说谎 1</b> · 无断言 1 · 未修 2 · 已修 0<br>
+  <span style="color:#8b8177">（无断言的行不算修好——它们只是「作者说修好了」）</span></div>
+</div>
+</body>
+</html>

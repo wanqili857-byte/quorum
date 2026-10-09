@@ -1,6 +1,41 @@
-# quorum · 多模型交叉审计
+# quorum
 
-**让几个不同厂商的模型互相挑错，把「审核」从一次性动作变成可证伪的回归。**
+**多模型交叉审计引擎：把「AI 说它修好了」变成一条能跑的命令。**
+
+*Multi-model cross-audit — every "I fixed it" becomes a runnable command.*
+
+[![CI](https://github.com/wanqili857-byte/quorum/actions/workflows/ci.yml/badge.svg)](https://github.com/wanqili857-byte/quorum/actions/workflows/ci.yml)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.9%20%7C%203.12-blue.svg)
+
+![quorum verify 判出「台账说谎」](docs/verify.png)
+
+## Highlights
+
+- **每条"修好了"都挂一条能跑的命令** —— `verify` 真跑，判四档；命令跑不过，那句"修好了"就是台账在说谎
+- **两个来源轴分开报** —— Model（**声明**，工具验不了）与 Harness（**事实**，从配置推出）。只跨一个方向，两个方向都会骗自己
+- **起审核员之前先验通道** —— 发一条**故意写错的凭据**；它还敢回话，就说明请求根本没走它声明的端点
+- **不自带模型，也不自带 harness** —— 任何 CLI 走 `exec` 接入，任何 Anthropic 兼容端点都能接；库代码里没有厂商名
+- **零密钥可跑** —— 仓库自带 demo：三个审核员是桩，**其中一个是错的**，`plate` 会把它和另外两家对齐在同一簇
+- **结论可复现** —— 材料快照指纹进结论头部；结论先写临时文件、四门全过再原子落位
+
+## 30 秒上手（不需要任何 API key）
+
+仓库自带一个 demo，三个「事故」都是真实情节的合成版：
+
+```bash
+pip install -e '.[dev]'
+python3 demo/project/make.py
+quorum run   --config demo/review.yaml --all
+quorum plate --config demo/review.yaml
+quorum verify --config demo/review.yaml --ledger demo/ledger_example.md
+```
+
+demo 里的三个审核员走**桩通道**（打印预设结论），所以整个过程零密钥、零网络。
+其中一个审核员的结论是**错的**——`quorum plate` 会把它和其他两家的正确结论对齐在同一簇，
+并在明细里逐条列出各家的原话，让你看见「同一处、不同结论」。
+
+## 五条命令
 
 ```bash
 quorum preflight --config review.yaml --all   # 阴性对照：证明每条通道真打到它声明的端点（能拦人）
@@ -50,22 +85,6 @@ quorum 针对的就是这两件事：**交叉**（谁说的、几家说、两个
 「独立进程」保证的是**进程之间**不共享状态；**你本机的 hook / skill / MCP 仍会加载**
 （手动新开一个会话也是这样，所以这是保真而不是缺陷）。这层边界的完整说明见
 [`CONTRACT.md`](CONTRACT.md) 契约一。
-
-## 30 秒上手（不需要任何 API key）
-
-仓库自带一个 demo，三个「事故」都是真实情节的合成版：
-
-```bash
-pip install -e '.[dev]'
-python3 demo/project/make.py
-quorum run   --config demo/review.yaml --all
-quorum plate --config demo/review.yaml
-quorum verify --config demo/review.yaml --ledger demo/ledger_example.md
-```
-
-demo 里的三个审核员走**桩通道**（打印预设结论），所以整个过程零密钥、零网络。
-其中一个审核员的结论是**错的**——`quorum plate` 会把它和其他两家的正确结论对齐在同一簇，
-并在明细里逐条列出各家的原话，让你看见「同一处、不同结论」。
 
 ## 真实使用
 
